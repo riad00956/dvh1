@@ -48,7 +48,7 @@ from aiogram import Router
 #                                    CONFIGURATION
 # =================================================================================
 BOT_TOKEN = "8011804210:AAE--NiCSKKjbX4TC3nJVxuW64Fu53Ywh0w"
-ADMIN_IDS = 8373846582                # Only these users can use the bot
+ADMIN_IDS = [8373846582]                # Only these users can use the bot
 JWT_SECRET = "supersecretkey12345678901234567890123456789012"  # 32+ chars
 DATABASE_PATH = "admin_bot.db"
 BACKUP_DIR = "backups"
