@@ -2,11 +2,11 @@
 """
 ================================================================================
         ULTIMATE TELEGRAM ADMIN BOT – AIOGRAM 3.7+ – RENDER READY
+                 NO state= IN CALLBACK QUERIES – FULLY FIXED
 ================================================================================
 Hardcoded bot token & admin ID. Full inline keyboard navigation.
 SQLite database. JWT key generation. 50+ admin features.
 Built-in aiohttp health check server on $PORT.
-Fully compatible with aiogram 3.7+ (DefaultBotProperties).
 ================================================================================
 """
 
@@ -30,8 +30,8 @@ from aiohttp import web
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.enums import ParseMode
-from aiogram.client.default import DefaultBotProperties  # CRITICAL FIX for aiogram 3.7+
-from aiogram.filters import Command
+from aiogram.client.default import DefaultBotProperties
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -70,7 +70,7 @@ logger = logging.getLogger(__name__)
 os.makedirs(BACKUP_DIR, exist_ok=True)
 
 # =================================================================================
-#                                    DATABASE INIT (AIOGRAM V3)
+#                                    DATABASE INIT
 # =================================================================================
 async def init_db():
     """Create all SQLite tables asynchronously."""
@@ -228,7 +228,7 @@ async def revoke_key(key_id: str, admin_id: int) -> bool:
 # =================================================================================
 bot = Bot(
     token=BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN)  # ✅ CORRECT
+    default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN)
 )
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
@@ -252,7 +252,7 @@ async def start_health_server():
     logger.info(f"Health check server running on port {HEALTH_CHECK_PORT}")
 
 # =================================================================================
-#                                    FSM STATES – AIOGRAM V3
+#                                    FSM STATES
 # =================================================================================
 class KeyGeneration(StatesGroup):
     waiting_user_id = State()
@@ -386,7 +386,7 @@ async def paginate_keys(page: int = 0, per_page: int = 10, filter_expired: bool 
     return keys, total
 
 # =================================================================================
-#                                    COMMAND HANDLERS – AIOGRAM V3
+#                                    COMMAND HANDLERS
 # =================================================================================
 @router.message(Command("start"))
 @admin_only
@@ -862,7 +862,7 @@ async def confirm_revoke(callback: CallbackQuery):
     await callback.answer()
 
 # =================================================================================
-#                                    KEY EDIT
+#                                    KEY EDIT – FIXED: NO state= IN DECORATOR
 # =================================================================================
 @router.callback_query(lambda c: c.data == "menu_edit")
 @admin_callback
@@ -915,9 +915,14 @@ async def edit_key_fetch(message: types.Message, state: FSMContext):
     )
     await state.set_state(KeyEdit.waiting_new_max_instances)
 
-@router.callback_query(lambda c: c.data == "edit_maxinst", state=KeyEdit.waiting_new_max_instances)
+# 🔧 FIXED: Removed state= from decorator, added explicit state check
+@router.callback_query(lambda c: c.data == "edit_maxinst")
 @admin_callback
 async def edit_maxinst_prompt(callback: CallbackQuery, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state != KeyEdit.waiting_new_max_instances.state:
+        await callback.answer("This action is not available now.", show_alert=True)
+        return
     await state.set_state(KeyEdit.waiting_new_max_instances)
     await callback.message.edit_text(
         "🖥 Enter the **new maximum number of instances**:",
@@ -947,9 +952,14 @@ async def edit_maxinst_save(message: types.Message, state: FSMContext):
     await state.clear()
     await message.reply(f"✅ Max instances updated to {new_max}.", reply_markup=main_menu_keyboard())
 
-@router.callback_query(lambda c: c.data == "edit_extend", state=KeyEdit.waiting_new_max_instances)
+# 🔧 FIXED: Removed state= from decorator
+@router.callback_query(lambda c: c.data == "edit_extend")
 @admin_callback
 async def edit_extend_prompt(callback: CallbackQuery, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state != KeyEdit.waiting_new_max_instances.state:
+        await callback.answer("This action is not available now.", show_alert=True)
+        return
     await state.set_state(KeyEdit.waiting_extend_days)
     await callback.message.edit_text(
         "📅 Enter the **number of days to extend** the key:",
@@ -986,9 +996,14 @@ async def edit_extend_save(message: types.Message, state: FSMContext):
     await state.clear()
     await message.reply(f"✅ Key extended until {new_expiry.strftime('%Y-%m-%d')}.", reply_markup=main_menu_keyboard())
 
-@router.callback_query(lambda c: c.data == "edit_note", state=KeyEdit.waiting_new_max_instances)
+# 🔧 FIXED: Removed state= from decorator
+@router.callback_query(lambda c: c.data == "edit_note")
 @admin_callback
 async def edit_note_prompt(callback: CallbackQuery, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state != KeyEdit.waiting_new_max_instances.state:
+        await callback.answer("This action is not available now.", show_alert=True)
+        return
     await state.set_state(KeyEdit.waiting_new_note)
     await callback.message.edit_text(
         "📝 Enter the **new note** for this key (or `-` to clear):",
@@ -1279,7 +1294,7 @@ async def blacklist_remove_execute(callback: CallbackQuery):
     await menu_blacklist(callback)
 
 # =================================================================================
-#                                    BROADCAST
+#                                    BROADCAST – FIXED: NO state= IN DECORATOR
 # =================================================================================
 @router.callback_query(lambda c: c.data == "menu_broadcast")
 @admin_callback
@@ -1323,9 +1338,14 @@ async def broadcast_preview(message: types.Message, state: FSMContext):
     )
     await state.set_state(Broadcast.waiting_confirm)
 
-@router.callback_query(lambda c: c.data == "broadcast_send", state=Broadcast.waiting_confirm)
+# 🔧 FIXED: Removed state= from decorator
+@router.callback_query(lambda c: c.data == "broadcast_send")
 @admin_callback
 async def broadcast_send(callback: CallbackQuery, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state != Broadcast.waiting_confirm.state:
+        await callback.answer("This action is not available now.", show_alert=True)
+        return
     data = await state.get_data()
     msg_text = data['message']
     recipients = data['recipients']
@@ -1354,9 +1374,14 @@ async def broadcast_send(callback: CallbackQuery, state: FSMContext):
     )
     await callback.answer()
 
-@router.callback_query(lambda c: c.data == "broadcast_edit", state=Broadcast.waiting_confirm)
+# 🔧 FIXED: Removed state= from decorator
+@router.callback_query(lambda c: c.data == "broadcast_edit")
 @admin_callback
 async def broadcast_edit(callback: CallbackQuery, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state != Broadcast.waiting_confirm.state:
+        await callback.answer("This action is not available now.", show_alert=True)
+        return
     await state.set_state(Broadcast.waiting_message)
     await callback.message.edit_text(
         "📢 **Edit Broadcast Message**\n\nSend the new message:",
@@ -1801,6 +1826,6 @@ async def main():
 
 if __name__ == "__main__":
     logger.info("=" * 60)
-    logger.info("ULTIMATE ADMIN BOT – AIOGRAM 3.7+ – RENDER READY")
+    logger.info("ULTIMATE ADMIN BOT – AIOGRAM 3.7+ – RENDER READY – FINAL FIX")
     logger.info("=" * 60)
     asyncio.run(main())
