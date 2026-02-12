@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-                    ULTIMATE TELEGRAM ADMIN BOT – CORE KEY MANAGER
+                    ULTIMATE TELEGRAM ADMIN BOT – AIOGRAM V3
 ================================================================================
 Hardcoded bot token & admin ID. Full inline keyboard navigation.
 SQLite database. JWT key generation. 50+ admin features.
-No Flask. No asyncpg. No bloat.
+Built-in aiohttp health check server for Render.
+No Flask. No contrib. No bloat.
 ================================================================================
 """
 
@@ -18,26 +19,24 @@ import csv
 import io
 import logging
 import asyncio
-import hashlib
-import hmac
 import secrets
-import string
-import time
+import shutil
 from datetime import datetime, timedelta
 from contextlib import closing
 from functools import wraps
 from typing import List, Dict, Tuple, Optional, Union
 
 import jwt
+import aiosqlite
+from aiohttp import web
 from aiogram import Bot, Dispatcher, types
-from aiogram.contrib.middlewares.logging import LoggingMiddleware
-from aiogram.contrib.fsm_storage.memory import MemoryStorage
-from aiogram.dispatcher import FSMContext
-from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import ParseMode, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-from aiogram.utils import executor
-from aiogram.utils.callback_data import CallbackData
-from aiogram.utils.exceptions import MessageNotModified, MessageToDeleteNotFound, ChatNotFound
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram import Router
+from aiogram.filters import Command
 
 # =================================================================================
 #                                    CONFIGURATION
@@ -46,8 +45,8 @@ BOT_TOKEN = "8011804210:AAE--NiCSKKjbX4TC3nJVxuW64Fu53Ywh0w"
 ADMIN_IDS = [8373846582]                # Only these users can use the bot
 JWT_SECRET = "supersecretkey12345678901234567890123456789012"  # 32+ chars
 DATABASE_PATH = "admin_bot.db"
-LOG_FILE = "admin_bot.log"
 BACKUP_DIR = "backups"
+HEALTH_CHECK_PORT = int(os.environ.get("PORT", 10000))  # Render port
 
 # =================================================================================
 #                                    LOGGING SETUP
@@ -56,160 +55,122 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler(LOG_FILE),
+        logging.FileHandler("admin_bot.log"),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
-# Ensure backup directory exists
 os.makedirs(BACKUP_DIR, exist_ok=True)
 
 # =================================================================================
 #                                    DATABASE INIT
 # =================================================================================
-def init_db():
-    """Create all SQLite tables if they don't exist."""
-    conn = sqlite3.connect(DATABASE_PATH)
-    c = conn.cursor()
-
-    # Core keys table
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS core_keys (
-            key_id TEXT PRIMARY KEY,
-            issued_to INTEGER,
-            issued_by INTEGER,
-            max_instances INTEGER,
-            expiry TIMESTAMP,
-            usage_count INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            note TEXT,
-            is_active INTEGER DEFAULT 1,
-            last_used TIMESTAMP,
-            template_name TEXT
-        )
-    """)
-
-    # User instances table
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS user_instances (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            key_id TEXT,
-            user_id INTEGER,
-            port INTEGER,
-            last_heartbeat TIMESTAMP,
-            is_active INTEGER DEFAULT 1,
-            ip_address TEXT,
-            version TEXT,
-            FOREIGN KEY(key_id) REFERENCES core_keys(key_id) ON DELETE CASCADE
-        )
-    """)
-
-    # Admin logs table
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS admin_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            admin_id INTEGER,
-            action TEXT,
-            target TEXT,
-            details TEXT,
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    # Blacklist table
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS blacklist (
-            user_id INTEGER PRIMARY KEY,
-            reason TEXT,
-            blocked_by INTEGER,
-            blocked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    # Key templates table
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS key_templates (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE,
-            days INTEGER,
-            max_instances INTEGER,
-            note TEXT,
-            created_by INTEGER,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    # Broadcast history
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS broadcast_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            admin_id INTEGER,
-            message TEXT,
-            recipients INTEGER,
-            successful INTEGER,
-            failed INTEGER,
-            sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    # Scheduled tasks
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS scheduled_tasks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            task_name TEXT,
-            interval_minutes INTEGER,
-            last_run TIMESTAMP,
-            is_enabled INTEGER DEFAULT 1
-        )
-    """)
-
-    # Indexes
-    c.execute("CREATE INDEX IF NOT EXISTS idx_keys_issued_to ON core_keys(issued_to)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_keys_expiry ON core_keys(expiry)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_instances_user ON user_instances(user_id)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_instances_key ON user_instances(key_id)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_logs_admin ON admin_logs(admin_id)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_logs_time ON admin_logs(timestamp)")
-
-    # Insert default scheduled tasks if not exists
-    c.execute("SELECT COUNT(*) FROM scheduled_tasks")
-    if c.fetchone()[0] == 0:
-        tasks = [
-            ("auto_cleanup", 60, None, 1),           # every hour
-            ("auto_backup", 1440, None, 1),          # every day
-            ("send_stats_report", 10080, None, 0)    # every week, disabled by default
-        ]
-        c.executemany(
-            "INSERT INTO scheduled_tasks (task_name, interval_minutes, last_run, is_enabled) VALUES (?, ?, ?, ?)",
-            tasks
-        )
-
-    conn.commit()
-    conn.close()
+async def init_db():
+    """Create all SQLite tables asynchronously."""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS core_keys (
+                key_id TEXT PRIMARY KEY,
+                issued_to INTEGER,
+                issued_by INTEGER,
+                max_instances INTEGER,
+                expiry TIMESTAMP,
+                usage_count INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                note TEXT,
+                is_active INTEGER DEFAULT 1,
+                last_used TIMESTAMP,
+                template_name TEXT
+            )
+        """)
+        
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS user_instances (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                key_id TEXT,
+                user_id INTEGER,
+                port INTEGER,
+                last_heartbeat TIMESTAMP,
+                is_active INTEGER DEFAULT 1,
+                ip_address TEXT,
+                version TEXT,
+                FOREIGN KEY(key_id) REFERENCES core_keys(key_id) ON DELETE CASCADE
+            )
+        """)
+        
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS admin_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_id INTEGER,
+                action TEXT,
+                target TEXT,
+                details TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS blacklist (
+                user_id INTEGER PRIMARY KEY,
+                reason TEXT,
+                blocked_by INTEGER,
+                blocked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS key_templates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE,
+                days INTEGER,
+                max_instances INTEGER,
+                note TEXT,
+                created_by INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS broadcast_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_id INTEGER,
+                message TEXT,
+                recipients INTEGER,
+                successful INTEGER,
+                failed INTEGER,
+                sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Indexes
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_keys_issued_to ON core_keys(issued_to)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_keys_expiry ON core_keys(expiry)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_instances_user ON user_instances(user_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_logs_time ON admin_logs(timestamp)")
+        
+        await db.commit()
     logger.info("Database initialized.")
-
-init_db()
 
 # =================================================================================
 #                                    DATABASE HELPERS
 # =================================================================================
-def get_db() -> sqlite3.Connection:
-    """Return a new SQLite connection with row factory."""
-    conn = sqlite3.connect(DATABASE_PATH)
-    conn.row_factory = sqlite3.Row
+async def get_db():
+    """Return a new aiosqlite connection."""
+    conn = await aiosqlite.connect(DATABASE_PATH)
+    conn.row_factory = aiosqlite.Row
     return conn
 
-def log_admin_action(admin_id: int, action: str, target: str, details: str = ""):
+async def log_admin_action(admin_id: int, action: str, target: str, details: str = ""):
     """Insert a log entry for admin actions."""
-    conn = get_db()
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO admin_logs (admin_id, action, target, details) VALUES (?, ?, ?, ?)",
-        (admin_id, action, target, details[:500])
-    )
-    conn.commit()
-    conn.close()
+    async with await get_db() as db:
+        await db.execute(
+            "INSERT INTO admin_logs (admin_id, action, target, details) VALUES (?, ?, ?, ?)",
+            (admin_id, action, target, details[:500])
+        )
+        await db.commit()
 
 # =================================================================================
 #                                    JWT HELPERS
@@ -228,18 +189,17 @@ def generate_jwt_key(user_id: int, days: int, max_instances: int, note: str = ""
         "template": template[:50]
     }
     token = jwt.encode(payload, JWT_SECRET, algorithm="HS256")
-
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("""
-        INSERT INTO core_keys
-        (key_id, issued_to, issued_by, max_instances, expiry, note, template_name)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (key_id, user_id, ADMIN_IDS[0], max_instances, expiry.isoformat(), note[:200], template[:50]))
-    conn.commit()
-    conn.close()
-
     return token, key_id, expiry
+
+async def store_key(key_id: str, user_id: int, admin_id: int, max_instances: int, expiry: datetime, note: str, template: str = ""):
+    """Store key in database."""
+    async with await get_db() as db:
+        await db.execute("""
+            INSERT INTO core_keys
+            (key_id, issued_to, issued_by, max_instances, expiry, note, template_name)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (key_id, user_id, admin_id, max_instances, expiry.isoformat(), note[:200], template[:50]))
+        await db.commit()
 
 def decode_jwt_token(token: str) -> Optional[dict]:
     """Decode and verify JWT. Returns payload or None."""
@@ -249,29 +209,42 @@ def decode_jwt_token(token: str) -> Optional[dict]:
     except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
         return None
 
-def revoke_key(key_id: str, admin_id: int) -> bool:
+async def revoke_key(key_id: str, admin_id: int) -> bool:
     """Revoke a key and deactivate its instances."""
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT * FROM core_keys WHERE key_id = ?", (key_id,))
-    key = c.fetchone()
-    if not key:
-        conn.close()
-        return False
-    c.execute("DELETE FROM core_keys WHERE key_id = ?", (key_id,))
-    c.execute("UPDATE user_instances SET is_active = 0 WHERE key_id = ?", (key_id,))
-    log_admin_action(admin_id, "revoke", f"key:{key_id}", f"user:{key['issued_to']}")
-    conn.commit()
-    conn.close()
+    async with await get_db() as db:
+        key = await db.execute_fetchone("SELECT * FROM core_keys WHERE key_id = ?", (key_id,))
+        if not key:
+            return False
+        await db.execute("DELETE FROM core_keys WHERE key_id = ?", (key_id,))
+        await db.execute("UPDATE user_instances SET is_active = 0 WHERE key_id = ?", (key_id,))
+        await log_admin_action(admin_id, "revoke", f"key:{key_id}", f"user:{key[1]}")
+        await db.commit()
     return True
 
 # =================================================================================
-#                                    BOT INITIALIZATION
+#                                    BOT INITIALIZATION (AIOGRAM V3)
 # =================================================================================
 bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.MARKDOWN)
 storage = MemoryStorage()
-dp = Dispatcher(bot, storage=storage)
-dp.middleware.setup(LoggingMiddleware())
+dp = Dispatcher(storage=storage)
+router = Router()
+dp.include_router(router)
+
+# =================================================================================
+#                                    HEALTH CHECK SERVER (AIOHTTP)
+# =================================================================================
+async def health_check(request):
+    return web.Response(text="OK")
+
+async def start_health_server():
+    app = web.Application()
+    app.router.add_get("/", health_check)
+    app.router.add_get("/health", health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", HEALTH_CHECK_PORT)
+    await site.start()
+    logger.info(f"Health check server running on port {HEALTH_CHECK_PORT}")
 
 # =================================================================================
 #                                    FSM STATES
@@ -281,7 +254,6 @@ class KeyGeneration(StatesGroup):
     waiting_days = State()
     waiting_max_instances = State()
     waiting_note = State()
-    waiting_template = State()
 
 class KeyEdit(StatesGroup):
     waiting_key_id = State()
@@ -300,21 +272,17 @@ class Broadcast(StatesGroup):
     waiting_message = State()
     waiting_confirm = State()
 
-class BackupRestore(StatesGroup):
-    waiting_file = State()
-
 class TemplateCreate(StatesGroup):
     waiting_name = State()
     waiting_days = State()
     waiting_max_instances = State()
     waiting_note = State()
 
-class CustomCommand(StatesGroup):
-    waiting_command = State()
-    waiting_response = State()
+class KeyRevoke(StatesGroup):
+    waiting_key_id = State()
 
 # =================================================================================
-#                                    AUTH DECORATORS
+#                                    ADMIN ONLY DECORATOR
 # =================================================================================
 def admin_only(func):
     @wraps(func)
@@ -335,95 +303,87 @@ def admin_callback(func):
     return wrapper
 
 # =================================================================================
-#                                    INLINE KEYBOARD FACTORIES
+#                                    INLINE KEYBOARDS
 # =================================================================================
 def main_menu_keyboard() -> InlineKeyboardMarkup:
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("🔑 Generate Key", callback_data="menu_genkey"),
-        InlineKeyboardButton("📋 List Keys", callback_data="menu_listkeys_0"),
-        InlineKeyboardButton("🔍 Search Keys", callback_data="menu_search"),
-        InlineKeyboardButton("📊 Statistics", callback_data="menu_stats"),
-        InlineKeyboardButton("🖥 Active Instances", callback_data="menu_instances_0"),
-        InlineKeyboardButton("🗑 Revoke Key", callback_data="menu_revoke"),
-        InlineKeyboardButton("✏️ Edit Key", callback_data="menu_edit"),
-        InlineKeyboardButton("📦 Key Templates", callback_data="menu_templates"),
-        InlineKeyboardButton("🚫 Blacklist", callback_data="menu_blacklist"),
-        InlineKeyboardButton("📢 Broadcast", callback_data="menu_broadcast"),
-        InlineKeyboardButton("🧹 Cleanup", callback_data="menu_cleanup"),
-        InlineKeyboardButton("💾 Backup/Restore", callback_data="menu_backup"),
-        InlineKeyboardButton("📤 Export Keys", callback_data="menu_export"),
-        InlineKeyboardButton("📜 Logs", callback_data="menu_logs_0"),
-        InlineKeyboardButton("⚙️ Settings", callback_data="menu_settings"),
-        InlineKeyboardButton("❌ Close", callback_data="menu_close")
-    )
-    return kb
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔑 Generate Key", callback_data="menu_genkey")
+    builder.button(text="📋 List Keys", callback_data="menu_listkeys_0")
+    builder.button(text="🔍 Search Keys", callback_data="menu_search")
+    builder.button(text="📊 Statistics", callback_data="menu_stats")
+    builder.button(text="🖥 Active Instances", callback_data="menu_instances_0")
+    builder.button(text="🗑 Revoke Key", callback_data="menu_revoke")
+    builder.button(text="✏️ Edit Key", callback_data="menu_edit")
+    builder.button(text="📦 Key Templates", callback_data="menu_templates")
+    builder.button(text="🚫 Blacklist", callback_data="menu_blacklist")
+    builder.button(text="📢 Broadcast", callback_data="menu_broadcast")
+    builder.button(text="🧹 Cleanup", callback_data="menu_cleanup")
+    builder.button(text="💾 Backup/Restore", callback_data="menu_backup")
+    builder.button(text="📤 Export Keys", callback_data="menu_export")
+    builder.button(text="📜 Logs", callback_data="menu_logs_0")
+    builder.button(text="⚙️ Settings", callback_data="menu_settings")
+    builder.button(text="❌ Close", callback_data="menu_close")
+    builder.adjust(2)
+    return builder.as_markup()
 
 def back_to_main_keyboard() -> InlineKeyboardMarkup:
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("🔙 Main Menu", callback_data="back_main"))
-    return kb
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔙 Main Menu", callback_data="back_main")
+    return builder.as_markup()
 
-def confirm_keyboard(action: str, key_id: str = None, extra: str = None) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardMarkup(row_width=2)
+def confirm_keyboard(action: str, key_id: str = None) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
     callback_data = f"confirm_{action}"
     if key_id:
         callback_data += f"_{key_id}"
-    if extra:
-        callback_data += f"_{extra}"
-    kb.add(
-        InlineKeyboardButton("✅ Confirm", callback_data=callback_data),
-        InlineKeyboardButton("❌ Cancel", callback_data="back_main")
-    )
-    return kb
+    builder.button(text="✅ Confirm", callback_data=callback_data)
+    builder.button(text="❌ Cancel", callback_data="back_main")
+    builder.adjust(2)
+    return builder.as_markup()
+
+def pagination_keyboard(base_callback: str, page: int, total_pages: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    if page > 0:
+        builder.button(text="◀️ Prev", callback_data=f"{base_callback}_{page-1}")
+    builder.button(text=f"{page+1}/{total_pages}", callback_data="noop")
+    if page < total_pages - 1:
+        builder.button(text="Next ▶️", callback_data=f"{base_callback}_{page+1}")
+    builder.adjust(3)
+    builder.row(InlineKeyboardButton(text="🔙 Main Menu", callback_data="back_main"))
+    return builder.as_markup()
 
 # =================================================================================
 #                                    PAGINATION HELPERS
 # =================================================================================
-def paginate_keys(page: int = 0, per_page: int = 10, filter_expired: bool = False, user_id: int = None):
+async def paginate_keys(page: int = 0, per_page: int = 10, filter_expired: bool = False, user_id: int = None):
     """Return paginated list of keys and total pages."""
-    conn = get_db()
-    c = conn.cursor()
-    query = "SELECT key_id, issued_to, max_instances, usage_count, expiry, note, created_at, is_active FROM core_keys"
-    params = []
-    conditions = []
-    if filter_expired:
-        conditions.append("expiry < datetime('now')")
-    if user_id:
-        conditions.append("issued_to = ?")
-        params.append(user_id)
-    if conditions:
-        query += " WHERE " + " AND ".join(conditions)
-    query += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
-    params.extend([per_page, page * per_page])
-    c.execute(query, params)
-    keys = c.fetchall()
-    
-    # Count total
-    count_query = "SELECT COUNT(*) FROM core_keys"
-    if conditions:
-        count_query += " WHERE " + " AND ".join(conditions)
-    c.execute(count_query, params[:len(params)-2] if user_id else [])
-    total = c.fetchone()[0]
-    conn.close()
+    async with await get_db() as db:
+        query = "SELECT key_id, issued_to, max_instances, usage_count, expiry, note, created_at, is_active FROM core_keys"
+        params = []
+        conditions = []
+        if filter_expired:
+            conditions.append("expiry < datetime('now')")
+        if user_id:
+            conditions.append("issued_to = ?")
+            params.append(user_id)
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+        params.extend([per_page, page * per_page])
+        cursor = await db.execute(query, params)
+        keys = await cursor.fetchall()
+        
+        count_query = "SELECT COUNT(*) FROM core_keys"
+        if conditions:
+            count_query += " WHERE " + " AND ".join(conditions)
+        cursor = await db.execute(count_query, params[:len(params)-2] if user_id else [])
+        total = (await cursor.fetchone())[0]
     return keys, total
-
-def pagination_keyboard(base_callback: str, page: int, total_pages: int) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardMarkup(row_width=3)
-    buttons = []
-    if page > 0:
-        buttons.append(InlineKeyboardButton("◀️ Prev", callback_data=f"{base_callback}_{page-1}"))
-    buttons.append(InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"))
-    if page < total_pages - 1:
-        buttons.append(InlineKeyboardButton("Next ▶️", callback_data=f"{base_callback}_{page+1}"))
-    kb.row(*buttons)
-    kb.add(InlineKeyboardButton("🔙 Main Menu", callback_data="back_main"))
-    return kb
 
 # =================================================================================
 #                                    COMMAND HANDLERS
 # =================================================================================
-@dp.message_handler(commands=['start'])
+@router.message(Command("start"))
 @admin_only
 async def cmd_start(message: types.Message):
     await message.answer(
@@ -432,49 +392,39 @@ async def cmd_start(message: types.Message):
         "All functions are available via the inline keyboard below.",
         reply_markup=main_menu_keyboard()
     )
-    log_admin_action(message.from_user.id, "command", "/start")
+    await log_admin_action(message.from_user.id, "command", "/start")
 
-@dp.message_handler(commands=['cancel'], state='*')
+@router.message(Command("cancel"))
 @admin_only
 async def cmd_cancel(message: types.Message, state: FSMContext):
     current_state = await state.get_state()
     if current_state is None:
         await message.reply("No active operation.")
         return
-    await state.finish()
+    await state.clear()
     await message.reply("❌ Operation cancelled.", reply_markup=main_menu_keyboard())
-
-@dp.message_handler(commands=['stats'])
-@admin_only
-async def cmd_stats(message: types.Message):
-    await show_statistics(message)
-
-@dp.message_handler(commands=['backup'])
-@admin_only
-async def cmd_backup(message: types.Message):
-    await create_backup(message)
 
 # =================================================================================
 #                                    CALLBACK: MAIN MENU
 # =================================================================================
-@dp.callback_query_handler(lambda c: c.data == "back_main")
+@router.callback_query(lambda c: c.data == "back_main")
 @admin_callback
 async def back_to_main(callback: CallbackQuery, state: FSMContext = None):
     if state:
-        await state.finish()
+        await state.clear()
     await callback.message.edit_text(
         "🔐 **Ultimate Admin Control Panel**",
         reply_markup=main_menu_keyboard()
     )
     await callback.answer()
 
-@dp.callback_query_handler(lambda c: c.data == "menu_close")
+@router.callback_query(lambda c: c.data == "menu_close")
 @admin_callback
 async def close_menu(callback: CallbackQuery):
     await callback.message.delete()
     await callback.answer("Menu closed.")
 
-@dp.callback_query_handler(lambda c: c.data == "noop")
+@router.callback_query(lambda c: c.data == "noop")
 @admin_callback
 async def noop(callback: CallbackQuery):
     await callback.answer()
@@ -482,49 +432,43 @@ async def noop(callback: CallbackQuery):
 # =================================================================================
 #                                    KEY GENERATION
 # =================================================================================
-@dp.callback_query_handler(lambda c: c.data == "menu_genkey")
+@router.callback_query(lambda c: c.data == "menu_genkey")
 @admin_callback
 async def menu_genkey(callback: CallbackQuery):
     # Check if templates exist
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT name FROM key_templates LIMIT 1")
-    has_templates = c.fetchone() is not None
-    conn.close()
+    async with await get_db() as db:
+        cursor = await db.execute("SELECT name FROM key_templates LIMIT 1")
+        has_templates = await cursor.fetchone() is not None
     
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("➕ Manual Entry", callback_data="genkey_manual"),
-        InlineKeyboardButton("📋 Use Template", callback_data="genkey_template")
-    )
-    kb.add(InlineKeyboardButton("🔙 Main Menu", callback_data="back_main"))
+    builder = InlineKeyboardBuilder()
+    builder.button(text="➕ Manual Entry", callback_data="genkey_manual")
+    if has_templates:
+        builder.button(text="📋 Use Template", callback_data="genkey_template")
+    builder.button(text="🔙 Main Menu", callback_data="back_main")
+    builder.adjust(1)
     
     await callback.message.edit_text(
-        "🔑 **Generate Core Key**\n\n"
-        "Choose input method:",
-        reply_markup=kb
+        "🔑 **Generate Core Key**\n\nChoose input method:",
+        reply_markup=builder.as_markup()
     )
     await callback.answer()
 
-@dp.callback_query_handler(lambda c: c.data == "genkey_manual")
+@router.callback_query(lambda c: c.data == "genkey_manual")
 @admin_callback
-async def genkey_manual(callback: CallbackQuery):
-    await KeyGeneration.waiting_user_id.set()
+async def genkey_manual(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(KeyGeneration.waiting_user_id)
     await callback.message.edit_text(
-        "🔑 **Manual Key Generation**\n\n"
-        "Enter the Telegram **User ID** of the recipient:",
+        "🔑 **Manual Key Generation**\n\nEnter the Telegram **User ID** of the recipient:",
         reply_markup=back_to_main_keyboard()
     )
     await callback.answer()
 
-@dp.callback_query_handler(lambda c: c.data == "genkey_template")
+@router.callback_query(lambda c: c.data == "genkey_template")
 @admin_callback
 async def genkey_template(callback: CallbackQuery):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT id, name, days, max_instances, note FROM key_templates ORDER BY name")
-    templates = c.fetchall()
-    conn.close()
+    async with await get_db() as db:
+        cursor = await db.execute("SELECT id, name, days, max_instances, note FROM key_templates ORDER BY name")
+        templates = await cursor.fetchall()
     
     if not templates:
         await callback.message.edit_text(
@@ -534,29 +478,29 @@ async def genkey_template(callback: CallbackQuery):
         await callback.answer()
         return
     
-    kb = InlineKeyboardMarkup(row_width=1)
+    builder = InlineKeyboardBuilder()
     for t in templates:
-        kb.add(InlineKeyboardButton(
-            f"{t['name']} ({t['days']}d, {t['max_instances']} inst)",
-            callback_data=f"genkey_usetemplate_{t['id']}"
-        ))
-    kb.add(InlineKeyboardButton("🔙 Main Menu", callback_data="back_main"))
+        builder.button(text=f"{t['name']} ({t['days']}d, {t['max_instances']} inst)",
+                       callback_data=f"genkey_usetemplate_{t['id']}")
+    builder.button(text="🔙 Main Menu", callback_data="back_main")
+    builder.adjust(1)
     
     await callback.message.edit_text(
         "📋 **Select a Template:**",
-        reply_markup=kb
+        reply_markup=builder.as_markup()
     )
     await callback.answer()
 
-@dp.callback_query_handler(lambda c: c.data.startswith("genkey_usetemplate_"))
+@router.callback_query(lambda c: c.data.startswith("genkey_usetemplate_"))
 @admin_callback
 async def genkey_use_template(callback: CallbackQuery, state: FSMContext):
     template_id = int(callback.data.split("_")[2])
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT name, days, max_instances, note FROM key_templates WHERE id = ?", (template_id,))
-    template = c.fetchone()
-    conn.close()
+    async with await get_db() as db:
+        cursor = await db.execute(
+            "SELECT name, days, max_instances, note FROM key_templates WHERE id = ?",
+            (template_id,)
+        )
+        template = await cursor.fetchone()
     
     await state.update_data(
         days=template['days'],
@@ -564,7 +508,7 @@ async def genkey_use_template(callback: CallbackQuery, state: FSMContext):
         note=template['note'],
         template_name=template['name']
     )
-    await KeyGeneration.waiting_user_id.set()
+    await state.set_state(KeyGeneration.waiting_user_id)
     await callback.message.edit_text(
         f"📋 **Using Template:** {template['name']}\n"
         f"Days: {template['days']}, Max Instances: {template['max_instances']}\n\n"
@@ -573,7 +517,7 @@ async def genkey_use_template(callback: CallbackQuery, state: FSMContext):
     )
     await callback.answer()
 
-@dp.message_handler(state=KeyGeneration.waiting_user_id)
+@router.message(KeyGeneration.waiting_user_id)
 @admin_only
 async def process_user_id(message: types.Message, state: FSMContext):
     try:
@@ -583,36 +527,34 @@ async def process_user_id(message: types.Message, state: FSMContext):
         return
     
     # Check blacklist
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT reason FROM blacklist WHERE user_id = ?", (user_id,))
-    blocked = c.fetchone()
-    conn.close()
+    async with await get_db() as db:
+        cursor = await db.execute("SELECT reason FROM blacklist WHERE user_id = ?", (user_id,))
+        blocked = await cursor.fetchone()
     if blocked:
         await message.reply(
             f"⛔ This user is **blacklisted**.\nReason: {blocked['reason']}\n\n"
             "You must remove them from blacklist first.",
             reply_markup=main_menu_keyboard()
         )
-        await state.finish()
+        await state.clear()
         return
     
     await state.update_data(user_id=user_id)
     data = await state.get_data()
-    if 'days' in data:  # from template
-        await KeyGeneration.waiting_note.set()
+    if 'days' in data:
+        await state.set_state(KeyGeneration.waiting_note)
         await message.reply(
             "📝 Enter an optional **note** for this key (or send `-` to skip):",
             reply_markup=back_to_main_keyboard()
         )
     else:
-        await KeyGeneration.waiting_days.set()
+        await state.set_state(KeyGeneration.waiting_days)
         await message.reply(
             "📅 Enter the number of **days** this key should be valid:",
             reply_markup=back_to_main_keyboard()
         )
 
-@dp.message_handler(state=KeyGeneration.waiting_days)
+@router.message(KeyGeneration.waiting_days)
 @admin_only
 async def process_days(message: types.Message, state: FSMContext):
     try:
@@ -623,13 +565,13 @@ async def process_days(message: types.Message, state: FSMContext):
         await message.reply("❌ Please enter a positive integer (days).")
         return
     await state.update_data(days=days)
-    await KeyGeneration.next()
+    await state.set_state(KeyGeneration.waiting_max_instances)
     await message.reply(
         "🖥 Enter the **maximum number of concurrent instances** (e.g., 3):",
         reply_markup=back_to_main_keyboard()
     )
 
-@dp.message_handler(state=KeyGeneration.waiting_max_instances)
+@router.message(KeyGeneration.waiting_max_instances)
 @admin_only
 async def process_max_instances(message: types.Message, state: FSMContext):
     try:
@@ -640,13 +582,13 @@ async def process_max_instances(message: types.Message, state: FSMContext):
         await message.reply("❌ Please enter a positive integer.")
         return
     await state.update_data(max_instances=max_inst)
-    await KeyGeneration.next()
+    await state.set_state(KeyGeneration.waiting_note)
     await message.reply(
         "📝 Enter an optional **note** for this key (or send `-` to skip):",
         reply_markup=back_to_main_keyboard()
     )
 
-@dp.message_handler(state=KeyGeneration.waiting_note)
+@router.message(KeyGeneration.waiting_note)
 @admin_only
 async def process_note(message: types.Message, state: FSMContext):
     note = message.text.strip()
@@ -660,8 +602,9 @@ async def process_note(message: types.Message, state: FSMContext):
     template = data.get('template_name', '')
     
     token, key_id, expiry = generate_jwt_key(user_id, days, max_inst, note, template)
+    await store_key(key_id, user_id, message.from_user.id, max_inst, expiry, note, template)
     
-    log_admin_action(
+    await log_admin_action(
         message.from_user.id,
         "genkey",
         f"user:{user_id} key:{key_id}",
@@ -679,41 +622,19 @@ async def process_note(message: types.Message, state: FSMContext):
         f"**Token:**\n`{token}`"
     )
     
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("📤 Send to User", callback_data=f"sendkey_{key_id}"),
-        InlineKeyboardButton("🔙 Main Menu", callback_data="back_main")
-    )
-    
-    await state.finish()
-    await message.reply(text, reply_markup=kb)
-
-@dp.callback_query_handler(lambda c: c.data.startswith("sendkey_"))
-@admin_callback
-async def send_key_to_user(callback: CallbackQuery):
-    key_id = callback.data.split("_")[1]
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT issued_to, key_id FROM core_keys WHERE key_id = ?", (key_id,))
-    key = c.fetchone()
-    conn.close()
-    
-    if not key:
-        await callback.answer("Key not found.", show_alert=True)
-        return
-    
-    token = None  # We need to retrieve the actual token – but we don't store it. We can regenerate?
-    # Since JWT is not stored, we need to re-encode. For simplicity, we'll ask admin to copy.
-    await callback.answer("Please copy the token from the previous message.", show_alert=True)
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔙 Main Menu", callback_data="back_main")
+    await state.clear()
+    await message.reply(text, reply_markup=builder.as_markup())
 
 # =================================================================================
 #                                    LIST KEYS WITH PAGINATION
 # =================================================================================
-@dp.callback_query_handler(lambda c: c.data.startswith("menu_listkeys_"))
+@router.callback_query(lambda c: c.data.startswith("menu_listkeys_"))
 @admin_callback
 async def menu_listkeys(callback: CallbackQuery):
     page = int(callback.data.split("_")[2])
-    keys, total = paginate_keys(page, per_page=8)
+    keys, total = await paginate_keys(page, per_page=8)
     total_pages = (total + 7) // 8
     
     if not keys:
@@ -738,95 +659,49 @@ async def menu_listkeys(callback: CallbackQuery):
         )
     
     kb = pagination_keyboard("menu_listkeys", page, total_pages)
-    # Add filter buttons
-    filter_kb = InlineKeyboardMarkup(row_width=2)
-    filter_kb.add(
-        InlineKeyboardButton("🔍 Filter Expired", callback_data="filter_expired"),
-        InlineKeyboardButton("🔍 Search by User", callback_data="menu_search")
-    )
-    kb.row(*filter_kb.inline_keyboard[0])
-    
-    try:
-        await callback.message.edit_text(text, reply_markup=kb)
-    except MessageNotModified:
-        pass
-    await callback.answer()
-
-@dp.callback_query_handler(lambda c: c.data == "filter_expired")
-@admin_callback
-async def filter_expired(callback: CallbackQuery):
-    keys, total = paginate_keys(page=0, per_page=8, filter_expired=True)
-    total_pages = (total + 7) // 8
-    
-    if not keys:
-        await callback.message.edit_text(
-            "✅ No expired keys found.",
-            reply_markup=main_menu_keyboard()
-        )
-        await callback.answer()
-        return
-    
-    text = "⚠️ **Expired Keys**\n\n"
-    for key in keys:
-        text += (
-            f"**ID:** `{key['key_id'][:8]}...`\n"
-            f"👤 User: `{key['issued_to']}`\n"
-            f"📅 Expired: {key['expiry'][:10]}\n\n"
-        )
-    
-    kb = InlineKeyboardMarkup().add(
-        InlineKeyboardButton("🔙 Main Menu", callback_data="back_main")
-    )
     await callback.message.edit_text(text, reply_markup=kb)
     await callback.answer()
 
 # =================================================================================
 #                                    SEARCH KEYS
 # =================================================================================
-@dp.callback_query_handler(lambda c: c.data == "menu_search")
+@router.callback_query(lambda c: c.data == "menu_search")
 @admin_callback
-async def menu_search(callback: CallbackQuery):
-    await KeySearch.waiting_query.set()
+async def menu_search(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(KeySearch.waiting_query)
     await callback.message.edit_text(
-        "🔍 **Search Keys**\n\n"
-        "Enter a **User ID** or **Key ID** (or part of it):",
+        "🔍 **Search Keys**\n\nEnter a **User ID** or **Key ID** (or part of it):",
         reply_markup=back_to_main_keyboard()
     )
     await callback.answer()
 
-@dp.message_handler(state=KeySearch.waiting_query)
+@router.message(KeySearch.waiting_query)
 @admin_only
 async def process_search(message: types.Message, state: FSMContext):
     query = message.text.strip()
-    conn = get_db()
-    c = conn.cursor()
-    
-    # Try to search by user ID or key ID
-    try:
-        user_id = int(query)
-        c.execute("""
-            SELECT key_id, issued_to, max_instances, usage_count, expiry, note, created_at
-            FROM core_keys WHERE issued_to = ?
-            ORDER BY created_at DESC LIMIT 20
-        """, (user_id,))
-    except ValueError:
-        # Search by key ID (partial match)
-        c.execute("""
-            SELECT key_id, issued_to, max_instances, usage_count, expiry, note, created_at
-            FROM core_keys WHERE key_id LIKE ?
-            ORDER BY created_at DESC LIMIT 20
-        """, (f"%{query}%",))
-    
-    keys = c.fetchall()
-    conn.close()
+    async with await get_db() as db:
+        try:
+            user_id = int(query)
+            cursor = await db.execute("""
+                SELECT key_id, issued_to, max_instances, usage_count, expiry, note, created_at
+                FROM core_keys WHERE issued_to = ?
+                ORDER BY created_at DESC LIMIT 20
+            """, (user_id,))
+        except ValueError:
+            cursor = await db.execute("""
+                SELECT key_id, issued_to, max_instances, usage_count, expiry, note, created_at
+                FROM core_keys WHERE key_id LIKE ?
+                ORDER BY created_at DESC LIMIT 20
+            """, (f"%{query}%",))
+        keys = await cursor.fetchall()
     
     if not keys:
         await message.reply("❌ No matching keys found.", reply_markup=main_menu_keyboard())
-        await state.finish()
+        await state.clear()
         return
     
     text = f"🔍 **Search Results** for `{query}`:\n\n"
-    for key in keys[:10]:  # show first 10
+    for key in keys[:10]:
         text += (
             f"**ID:** `{key['key_id'][:8]}...`\n"
             f"👤 User: `{key['issued_to']}`\n"
@@ -836,57 +711,27 @@ async def process_search(message: types.Message, state: FSMContext):
     if len(keys) > 10:
         text += f"... and {len(keys)-10} more.\n"
     
-    await state.finish()
+    await state.clear()
     await message.reply(text, reply_markup=main_menu_keyboard())
 
 # =================================================================================
-#                                    STATISTICS (DETAILED)
+#                                    STATISTICS
 # =================================================================================
-@dp.callback_query_handler(lambda c: c.data == "menu_stats")
+@router.callback_query(lambda c: c.data == "menu_stats")
 @admin_callback
 async def menu_stats(callback: CallbackQuery):
-    await show_statistics(callback.message)
-    await callback.answer()
-
-async def show_statistics(message: types.Message):
-    conn = get_db()
-    c = conn.cursor()
-    
-    # Basic counts
-    c.execute("SELECT COUNT(*) FROM core_keys")
-    total_keys = c.fetchone()[0]
-    c.execute("SELECT COUNT(*) FROM core_keys WHERE expiry < datetime('now')")
-    expired_keys = c.fetchone()[0]
-    c.execute("SELECT COUNT(*) FROM core_keys WHERE is_active = 1 AND expiry > datetime('now')")
-    active_keys = c.fetchone()[0]
-    c.execute("SELECT COUNT(*) FROM user_instances WHERE is_active = 1")
-    active_instances = c.fetchone()[0]
-    c.execute("SELECT COUNT(*) FROM user_instances")
-    total_instances = c.fetchone()[0]
-    c.execute("SELECT SUM(usage_count) FROM core_keys")
-    total_usage = c.fetchone()[0] or 0
-    c.execute("SELECT COUNT(DISTINCT issued_to) FROM core_keys")
-    unique_users = c.fetchone()[0]
-    
-    # Keys by expiry
-    c.execute("SELECT COUNT(*) FROM core_keys WHERE expiry < datetime('now', '+7 days') AND expiry > datetime('now')")
-    expiring_soon = c.fetchone()[0]
-    
-    # Most used keys
-    c.execute("""
-        SELECT key_id, issued_to, usage_count FROM core_keys
-        ORDER BY usage_count DESC LIMIT 3
-    """)
-    top_keys = c.fetchall()
-    
-    # Top users
-    c.execute("""
-        SELECT issued_to, COUNT(*) as key_count, SUM(usage_count) as total_usage
-        FROM core_keys GROUP BY issued_to ORDER BY total_usage DESC LIMIT 3
-    """)
-    top_users = c.fetchall()
-    
-    conn.close()
+    async with await get_db() as db:
+        total_keys = (await db.execute_fetchone("SELECT COUNT(*) FROM core_keys"))[0]
+        expired_keys = (await db.execute_fetchone("SELECT COUNT(*) FROM core_keys WHERE expiry < datetime('now')"))[0]
+        active_keys = (await db.execute_fetchone("SELECT COUNT(*) FROM core_keys WHERE is_active = 1 AND expiry > datetime('now')"))[0]
+        active_instances = (await db.execute_fetchone("SELECT COUNT(*) FROM user_instances WHERE is_active = 1"))[0]
+        total_instances = (await db.execute_fetchone("SELECT COUNT(*) FROM user_instances"))[0]
+        total_usage = (await db.execute_fetchone("SELECT SUM(usage_count) FROM core_keys"))[0] or 0
+        unique_users = (await db.execute_fetchone("SELECT COUNT(DISTINCT issued_to) FROM core_keys"))[0]
+        expiring_soon = (await db.execute_fetchone("""
+            SELECT COUNT(*) FROM core_keys 
+            WHERE expiry < datetime('now', '+7 days') AND expiry > datetime('now')
+        """))[0]
     
     text = (
         "📊 **Admin Statistics**\n\n"
@@ -897,45 +742,34 @@ async def show_statistics(message: types.Message):
         f"🖥 **Active Instances:** `{active_instances}`\n"
         f"📦 **Total Instances:** `{total_instances}`\n"
         f"🗳 **Total Key Usage:** `{total_usage}`\n"
-        f"👥 **Unique Users:** `{unique_users}`\n\n"
+        f"👥 **Unique Users:** `{unique_users}`\n"
     )
     
-    if top_keys:
-        text += "🏆 **Most Used Keys:**\n"
-        for k in top_keys:
-            text += f"  `{k['key_id'][:8]}...` – {k['usage_count']} uses (user {k['issued_to']})\n"
-    
-    if top_users:
-        text += "\n👤 **Top Users:**\n"
-        for u in top_users:
-            text += f"  User `{u['issued_to']}` – {u['key_count']} keys, {u['total_usage']} uses\n"
-    
-    await message.reply(text, reply_markup=main_menu_keyboard())
+    await callback.message.edit_text(text, reply_markup=main_menu_keyboard())
+    await callback.answer()
 
 # =================================================================================
-#                                    ACTIVE INSTANCES (PAGINATED)
+#                                    ACTIVE INSTANCES
 # =================================================================================
-@dp.callback_query_handler(lambda c: c.data.startswith("menu_instances_"))
+@router.callback_query(lambda c: c.data.startswith("menu_instances_"))
 @admin_callback
 async def menu_instances(callback: CallbackQuery):
     page = int(callback.data.split("_")[2])
     per_page = 8
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("""
-        SELECT i.user_id, i.port, i.last_heartbeat, i.ip_address, i.version,
-               k.key_id, k.issued_to, k.expiry
-        FROM user_instances i
-        JOIN core_keys k ON i.key_id = k.key_id
-        WHERE i.is_active = 1
-        ORDER BY i.last_heartbeat DESC
-        LIMIT ? OFFSET ?
-    """, (per_page, page * per_page))
-    rows = c.fetchall()
     
-    c.execute("SELECT COUNT(*) FROM user_instances WHERE is_active = 1")
-    total = c.fetchone()[0]
-    conn.close()
+    async with await get_db() as db:
+        cursor = await db.execute("""
+            SELECT i.user_id, i.port, i.last_heartbeat, i.ip_address, i.version,
+                   k.key_id, k.issued_to, k.expiry
+            FROM user_instances i
+            JOIN core_keys k ON i.key_id = k.key_id
+            WHERE i.is_active = 1
+            ORDER BY i.last_heartbeat DESC
+            LIMIT ? OFFSET ?
+        """, (per_page, page * per_page))
+        rows = await cursor.fetchall()
+        
+        total = (await db.execute_fetchone("SELECT COUNT(*) FROM user_instances WHERE is_active = 1"))[0]
     
     total_pages = (total + per_page - 1) // per_page
     
@@ -960,30 +794,24 @@ async def menu_instances(callback: CallbackQuery):
         )
     
     kb = pagination_keyboard("menu_instances", page, total_pages)
-    kb.row(InlineKeyboardButton("🔄 Refresh", callback_data=f"menu_instances_{page}"))
-    
     await callback.message.edit_text(text, reply_markup=kb)
     await callback.answer()
 
 # =================================================================================
 #                                    REVOKE KEY
 # =================================================================================
-@dp.callback_query_handler(lambda c: c.data == "menu_revoke")
+@router.callback_query(lambda c: c.data == "menu_revoke")
 @admin_callback
-async def menu_revoke(callback: CallbackQuery):
-    await KeyRevoke.waiting_key_id.set()
+async def menu_revoke(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(KeyRevoke.waiting_key_id)
     await callback.message.edit_text(
         "🗑 **Revoke Core Key**\n\n"
-        "Send the **Key ID** or the full **JWT token**.\n"
-        "You can find Key IDs in /listkeys.",
+        "Send the **Key ID** or the full **JWT token**.",
         reply_markup=back_to_main_keyboard()
     )
     await callback.answer()
 
-class KeyRevoke(StatesGroup):
-    waiting_key_id = State()
-
-@dp.message_handler(state=KeyRevoke.waiting_key_id)
+@router.message(KeyRevoke.waiting_key_id)
 @admin_only
 async def process_revoke(message: types.Message, state: FSMContext):
     key_input = message.text.strip()
@@ -999,31 +827,28 @@ async def process_revoke(message: types.Message, state: FSMContext):
     else:
         key_id = key_input
     
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT * FROM core_keys WHERE key_id = ?", (key_id,))
-    key = c.fetchone()
-    conn.close()
+    async with await get_db() as db:
+        key = await db.execute_fetchone("SELECT * FROM core_keys WHERE key_id = ?", (key_id,))
     
     if not key:
         await message.reply("❌ Key not found.")
-        await state.finish()
+        await state.clear()
         return
     
     await state.update_data(key_id=key_id)
     await message.reply(
         f"⚠️ **Are you sure?**\n\n"
-        f"This will revoke key `{key_id[:8]}...` for user `{key['issued_to']}`.\n"
+        f"This will revoke key `{key_id[:8]}...` for user `{key[1]}`.\n"
         f"All active instances will be deactivated.",
         reply_markup=confirm_keyboard("revoke", key_id)
     )
-    await state.finish()
+    await state.clear()
 
-@dp.callback_query_handler(lambda c: c.data.startswith("confirm_revoke_"))
+@router.callback_query(lambda c: c.data.startswith("confirm_revoke_"))
 @admin_callback
 async def confirm_revoke(callback: CallbackQuery):
     key_id = callback.data.split("_")[2]
-    success = revoke_key(key_id, callback.from_user.id)
+    success = await revoke_key(key_id, callback.from_user.id)
     if success:
         await callback.message.edit_text(
             f"✅ Key `{key_id[:8]}...` revoked and instances deactivated.",
@@ -1034,20 +859,19 @@ async def confirm_revoke(callback: CallbackQuery):
     await callback.answer()
 
 # =================================================================================
-#                                    EDIT KEY
+#                                    KEY EDIT (SIMPLIFIED)
 # =================================================================================
-@dp.callback_query_handler(lambda c: c.data == "menu_edit")
+@router.callback_query(lambda c: c.data == "menu_edit")
 @admin_callback
-async def menu_edit(callback: CallbackQuery):
-    await KeyEdit.waiting_key_id.set()
+async def menu_edit(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(KeyEdit.waiting_key_id)
     await callback.message.edit_text(
-        "✏️ **Edit Core Key**\n\n"
-        "Send the **Key ID** or full **JWT token** of the key you want to edit.",
+        "✏️ **Edit Core Key**\n\nSend the **Key ID** or full **JWT token**.",
         reply_markup=back_to_main_keyboard()
     )
     await callback.answer()
 
-@dp.message_handler(state=KeyEdit.waiting_key_id)
+@router.message(KeyEdit.waiting_key_id)
 @admin_only
 async def edit_key_fetch(message: types.Message, state: FSMContext):
     key_input = message.text.strip()
@@ -1063,49 +887,42 @@ async def edit_key_fetch(message: types.Message, state: FSMContext):
     else:
         key_id = key_input
     
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT * FROM core_keys WHERE key_id = ?", (key_id,))
-    key = c.fetchone()
-    conn.close()
+    async with await get_db() as db:
+        key = await db.execute_fetchone("SELECT * FROM core_keys WHERE key_id = ?", (key_id,))
     
     if not key:
         await message.reply("❌ Key not found.")
-        await state.finish()
+        await state.clear()
         return
     
     await state.update_data(key_id=key_id)
     
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("📅 Extend Expiry", callback_data="edit_extend"),
-        InlineKeyboardButton("🖥 Change Max Instances", callback_data="edit_maxinst"),
-        InlineKeyboardButton("📝 Edit Note", callback_data="edit_note"),
-        InlineKeyboardButton("🔙 Cancel", callback_data="back_main")
-    )
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🖥 Change Max Instances", callback_data="edit_maxinst")
+    builder.button(text="📅 Extend Expiry", callback_data="edit_extend")
+    builder.button(text="📝 Edit Note", callback_data="edit_note")
+    builder.button(text="🔙 Cancel", callback_data="back_main")
+    builder.adjust(2)
     
     await message.reply(
         f"✏️ **Editing Key** `{key_id[:8]}...`\n"
-        f"Current settings:\n"
-        f"Expires: {key['expiry'][:10]}\n"
-        f"Max Instances: {key['max_instances']}\n"
-        f"Note: {key['note'] or '—'}\n\n"
+        f"Current: Max Instances={key['max_instances']}, Expires={key['expiry'][:10]}, Note={key['note'] or '—'}\n\n"
         "What would you like to change?",
-        reply_markup=kb
+        reply_markup=builder.as_markup()
     )
-    await state.set_state(KeyEdit.waiting_new_max_instances)  # temporary, we'll use callback to switch
+    await state.set_state(KeyEdit.waiting_new_max_instances)
 
-@dp.callback_query_handler(lambda c: c.data == "edit_maxinst", state=KeyEdit.waiting_new_max_instances)
+@router.callback_query(lambda c: c.data == "edit_maxinst", state=KeyEdit.waiting_new_max_instances)
 @admin_callback
 async def edit_maxinst_prompt(callback: CallbackQuery, state: FSMContext):
-    await KeyEdit.waiting_new_max_instances.set()
+    await state.set_state(KeyEdit.waiting_new_max_instances)
     await callback.message.edit_text(
         "🖥 Enter the **new maximum number of instances**:",
         reply_markup=back_to_main_keyboard()
     )
     await callback.answer()
 
-@dp.message_handler(state=KeyEdit.waiting_new_max_instances)
+@router.message(KeyEdit.waiting_new_max_instances)
 @admin_only
 async def edit_maxinst_save(message: types.Message, state: FSMContext):
     try:
@@ -1119,27 +936,25 @@ async def edit_maxinst_save(message: types.Message, state: FSMContext):
     data = await state.get_data()
     key_id = data['key_id']
     
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("UPDATE core_keys SET max_instances = ? WHERE key_id = ?", (new_max, key_id))
-    conn.commit()
-    conn.close()
+    async with await get_db() as db:
+        await db.execute("UPDATE core_keys SET max_instances = ? WHERE key_id = ?", (new_max, key_id))
+        await db.commit()
     
-    log_admin_action(message.from_user.id, "edit_key", f"key:{key_id}", f"max_instances={new_max}")
-    await state.finish()
+    await log_admin_action(message.from_user.id, "edit_key", f"key:{key_id}", f"max_instances={new_max}")
+    await state.clear()
     await message.reply(f"✅ Max instances updated to {new_max}.", reply_markup=main_menu_keyboard())
 
-@dp.callback_query_handler(lambda c: c.data == "edit_extend", state=KeyEdit.waiting_new_max_instances)
+@router.callback_query(lambda c: c.data == "edit_extend", state=KeyEdit.waiting_new_max_instances)
 @admin_callback
 async def edit_extend_prompt(callback: CallbackQuery, state: FSMContext):
-    await KeyEdit.waiting_extend_days.set()
+    await state.set_state(KeyEdit.waiting_extend_days)
     await callback.message.edit_text(
         "📅 Enter the **number of days to extend** the key:",
         reply_markup=back_to_main_keyboard()
     )
     await callback.answer()
 
-@dp.message_handler(state=KeyEdit.waiting_extend_days)
+@router.message(KeyEdit.waiting_extend_days)
 @admin_only
 async def edit_extend_save(message: types.Message, state: FSMContext):
     try:
@@ -1153,36 +968,32 @@ async def edit_extend_save(message: types.Message, state: FSMContext):
     data = await state.get_data()
     key_id = data['key_id']
     
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT expiry FROM core_keys WHERE key_id = ?", (key_id,))
-    row = c.fetchone()
-    if not row:
-        await message.reply("❌ Key not found.")
-        await state.finish()
-        return
+    async with await get_db() as db:
+        row = await db.execute_fetchone("SELECT expiry FROM core_keys WHERE key_id = ?", (key_id,))
+        if not row:
+            await message.reply("❌ Key not found.")
+            await state.clear()
+            return
+        current_expiry = datetime.fromisoformat(row[0])
+        new_expiry = current_expiry + timedelta(days=days)
+        await db.execute("UPDATE core_keys SET expiry = ? WHERE key_id = ?", (new_expiry.isoformat(), key_id))
+        await db.commit()
     
-    current_expiry = datetime.fromisoformat(row['expiry'])
-    new_expiry = current_expiry + timedelta(days=days)
-    c.execute("UPDATE core_keys SET expiry = ? WHERE key_id = ?", (new_expiry.isoformat(), key_id))
-    conn.commit()
-    conn.close()
-    
-    log_admin_action(message.from_user.id, "extend_key", f"key:{key_id}", f"+{days} days")
-    await state.finish()
+    await log_admin_action(message.from_user.id, "extend_key", f"key:{key_id}", f"+{days} days")
+    await state.clear()
     await message.reply(f"✅ Key extended until {new_expiry.strftime('%Y-%m-%d')}.", reply_markup=main_menu_keyboard())
 
-@dp.callback_query_handler(lambda c: c.data == "edit_note", state=KeyEdit.waiting_new_max_instances)
+@router.callback_query(lambda c: c.data == "edit_note", state=KeyEdit.waiting_new_max_instances)
 @admin_callback
 async def edit_note_prompt(callback: CallbackQuery, state: FSMContext):
-    await KeyEdit.waiting_new_note.set()
+    await state.set_state(KeyEdit.waiting_new_note)
     await callback.message.edit_text(
         "📝 Enter the **new note** for this key (or `-` to clear):",
         reply_markup=back_to_main_keyboard()
     )
     await callback.answer()
 
-@dp.message_handler(state=KeyEdit.waiting_new_note)
+@router.message(KeyEdit.waiting_new_note)
 @admin_only
 async def edit_note_save(message: types.Message, state: FSMContext):
     new_note = message.text.strip()
@@ -1192,59 +1003,54 @@ async def edit_note_save(message: types.Message, state: FSMContext):
     data = await state.get_data()
     key_id = data['key_id']
     
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("UPDATE core_keys SET note = ? WHERE key_id = ?", (new_note[:200], key_id))
-    conn.commit()
-    conn.close()
+    async with await get_db() as db:
+        await db.execute("UPDATE core_keys SET note = ? WHERE key_id = ?", (new_note[:200], key_id))
+        await db.commit()
     
-    log_admin_action(message.from_user.id, "edit_key", f"key:{key_id}", f"note updated")
-    await state.finish()
+    await log_admin_action(message.from_user.id, "edit_key", f"key:{key_id}", f"note updated")
+    await state.clear()
     await message.reply(f"✅ Note updated.", reply_markup=main_menu_keyboard())
 
 # =================================================================================
 #                                    KEY TEMPLATES
 # =================================================================================
-@dp.callback_query_handler(lambda c: c.data == "menu_templates")
+@router.callback_query(lambda c: c.data == "menu_templates")
 @admin_callback
 async def menu_templates(callback: CallbackQuery):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT id, name, days, max_instances, note, created_at FROM key_templates ORDER BY name")
-    templates = c.fetchall()
-    conn.close()
+    async with await get_db() as db:
+        cursor = await db.execute("SELECT id, name, days, max_instances, note, created_at FROM key_templates ORDER BY name")
+        templates = await cursor.fetchall()
     
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("➕ Create Template", callback_data="template_create"),
-        InlineKeyboardButton("🗑 Delete Template", callback_data="template_delete")
-    )
-    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="➕ Create Template", callback_data="template_create")
     if templates:
-        text = "📦 **Key Templates**\n\n"
+        builder.button(text="🗑 Delete Template", callback_data="template_delete")
+    builder.button(text="🔙 Main Menu", callback_data="back_main")
+    builder.adjust(2)
+    
+    text = "📦 **Key Templates**\n\n"
+    if templates:
         for t in templates:
             text += f"• **{t['name']}** – {t['days']}d, {t['max_instances']} inst\n"
             if t['note']:
                 text += f"  Note: {t['note']}\n"
-        text += "\nSelect an action:"
     else:
-        text = "📦 No templates yet. Create one!"
+        text += "No templates yet. Create one!"
     
-    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.message.edit_text(text, reply_markup=builder.as_markup())
     await callback.answer()
 
-@dp.callback_query_handler(lambda c: c.data == "template_create")
+@router.callback_query(lambda c: c.data == "template_create")
 @admin_callback
-async def template_create_start(callback: CallbackQuery):
-    await TemplateCreate.waiting_name.set()
+async def template_create_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(TemplateCreate.waiting_name)
     await callback.message.edit_text(
-        "📝 **Create Key Template**\n\n"
-        "Enter a **name** for this template (e.g., 'Basic', 'Premium'):",
+        "📝 **Create Key Template**\n\nEnter a **name** for this template (e.g., 'Basic', 'Premium'):",
         reply_markup=back_to_main_keyboard()
     )
     await callback.answer()
 
-@dp.message_handler(state=TemplateCreate.waiting_name)
+@router.message(TemplateCreate.waiting_name)
 @admin_only
 async def template_create_name(message: types.Message, state: FSMContext):
     name = message.text.strip()
@@ -1252,22 +1058,20 @@ async def template_create_name(message: types.Message, state: FSMContext):
         await message.reply("❌ Name cannot be empty.")
         return
     
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT name FROM key_templates WHERE name = ?", (name,))
-    if c.fetchone():
-        await message.reply("❌ A template with that name already exists. Choose another name.")
-        return
-    conn.close()
+    async with await get_db() as db:
+        existing = await db.execute_fetchone("SELECT name FROM key_templates WHERE name = ?", (name,))
+        if existing:
+            await message.reply("❌ A template with that name already exists. Choose another name.")
+            return
     
     await state.update_data(name=name)
-    await TemplateCreate.next()
+    await state.set_state(TemplateCreate.waiting_days)
     await message.reply(
         "📅 Enter the **number of days** this key should be valid:",
         reply_markup=back_to_main_keyboard()
     )
 
-@dp.message_handler(state=TemplateCreate.waiting_days)
+@router.message(TemplateCreate.waiting_days)
 @admin_only
 async def template_create_days(message: types.Message, state: FSMContext):
     try:
@@ -1278,13 +1082,13 @@ async def template_create_days(message: types.Message, state: FSMContext):
         await message.reply("❌ Please enter a positive integer.")
         return
     await state.update_data(days=days)
-    await TemplateCreate.next()
+    await state.set_state(TemplateCreate.waiting_max_instances)
     await message.reply(
         "🖥 Enter the **maximum number of instances**:",
         reply_markup=back_to_main_keyboard()
     )
 
-@dp.message_handler(state=TemplateCreate.waiting_max_instances)
+@router.message(TemplateCreate.waiting_max_instances)
 @admin_only
 async def template_create_maxinst(message: types.Message, state: FSMContext):
     try:
@@ -1295,13 +1099,13 @@ async def template_create_maxinst(message: types.Message, state: FSMContext):
         await message.reply("❌ Please enter a positive integer.")
         return
     await state.update_data(max_instances=max_inst)
-    await TemplateCreate.next()
+    await state.set_state(TemplateCreate.waiting_note)
     await message.reply(
         "📝 Enter an optional **note** for this template (or `-` to skip):",
         reply_markup=back_to_main_keyboard()
     )
 
-@dp.message_handler(state=TemplateCreate.waiting_note)
+@router.message(TemplateCreate.waiting_note)
 @admin_only
 async def template_create_note(message: types.Message, state: FSMContext):
     note = message.text.strip()
@@ -1313,79 +1117,71 @@ async def template_create_note(message: types.Message, state: FSMContext):
     days = data['days']
     max_inst = data['max_instances']
     
-    conn = get_db()
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO key_templates (name, days, max_instances, note, created_by) VALUES (?, ?, ?, ?, ?)",
-        (name, days, max_inst, note[:200], message.from_user.id)
-    )
-    conn.commit()
-    conn.close()
+    async with await get_db() as db:
+        await db.execute(
+            "INSERT INTO key_templates (name, days, max_instances, note, created_by) VALUES (?, ?, ?, ?, ?)",
+            (name, days, max_inst, note[:200], message.from_user.id)
+        )
+        await db.commit()
     
-    log_admin_action(message.from_user.id, "create_template", f"template:{name}")
-    await state.finish()
+    await log_admin_action(message.from_user.id, "create_template", f"template:{name}")
+    await state.clear()
     await message.reply(f"✅ Template '{name}' created.", reply_markup=main_menu_keyboard())
 
-@dp.callback_query_handler(lambda c: c.data == "template_delete")
+@router.callback_query(lambda c: c.data == "template_delete")
 @admin_callback
 async def template_delete_menu(callback: CallbackQuery):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT id, name FROM key_templates ORDER BY name")
-    templates = c.fetchall()
-    conn.close()
+    async with await get_db() as db:
+        cursor = await db.execute("SELECT id, name FROM key_templates ORDER BY name")
+        templates = await cursor.fetchall()
     
     if not templates:
         await callback.answer("No templates to delete.", show_alert=True)
         return
     
-    kb = InlineKeyboardMarkup(row_width=1)
+    builder = InlineKeyboardBuilder()
     for t in templates:
-        kb.add(InlineKeyboardButton(f"❌ {t['name']}", callback_data=f"template_del_{t['id']}"))
-    kb.add(InlineKeyboardButton("🔙 Back", callback_data="menu_templates"))
+        builder.button(text=f"❌ {t['name']}", callback_data=f"template_del_{t['id']}")
+    builder.button(text="🔙 Back", callback_data="menu_templates")
+    builder.adjust(1)
     
     await callback.message.edit_text(
         "🗑 **Delete Template**\n\nSelect a template to delete:",
-        reply_markup=kb
+        reply_markup=builder.as_markup()
     )
     await callback.answer()
 
-@dp.callback_query_handler(lambda c: c.data.startswith("template_del_"))
+@router.callback_query(lambda c: c.data.startswith("template_del_"))
 @admin_callback
 async def template_delete_execute(callback: CallbackQuery):
     template_id = int(callback.data.split("_")[2])
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT name FROM key_templates WHERE id = ?", (template_id,))
-    template = c.fetchone()
-    if template:
-        c.execute("DELETE FROM key_templates WHERE id = ?", (template_id,))
-        conn.commit()
-        log_admin_action(callback.from_user.id, "delete_template", f"template:{template['name']}")
-        await callback.answer(f"Template '{template['name']}' deleted.", show_alert=True)
-    else:
-        await callback.answer("Template not found.", show_alert=True)
-    conn.close()
+    async with await get_db() as db:
+        name_row = await db.execute_fetchone("SELECT name FROM key_templates WHERE id = ?", (template_id,))
+        if name_row:
+            await db.execute("DELETE FROM key_templates WHERE id = ?", (template_id,))
+            await db.commit()
+            await log_admin_action(callback.from_user.id, "delete_template", f"template:{name_row[0]}")
+            await callback.answer(f"Template '{name_row[0]}' deleted.", show_alert=True)
+        else:
+            await callback.answer("Template not found.", show_alert=True)
     await menu_templates(callback)
 
 # =================================================================================
 #                                    BLACKLIST
 # =================================================================================
-@dp.callback_query_handler(lambda c: c.data == "menu_blacklist")
+@router.callback_query(lambda c: c.data == "menu_blacklist")
 @admin_callback
 async def menu_blacklist(callback: CallbackQuery):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT user_id, reason, blocked_at FROM blacklist ORDER BY blocked_at DESC LIMIT 15")
-    blocked = c.fetchall()
-    conn.close()
+    async with await get_db() as db:
+        cursor = await db.execute("SELECT user_id, reason, blocked_at FROM blacklist ORDER BY blocked_at DESC LIMIT 15")
+        blocked = await cursor.fetchall()
     
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("➕ Add to Blacklist", callback_data="blacklist_add"),
-        InlineKeyboardButton("➖ Remove from Blacklist", callback_data="blacklist_remove")
-    )
-    kb.add(InlineKeyboardButton("🔙 Main Menu", callback_data="back_main"))
+    builder = InlineKeyboardBuilder()
+    builder.button(text="➕ Add to Blacklist", callback_data="blacklist_add")
+    if blocked:
+        builder.button(text="➖ Remove from Blacklist", callback_data="blacklist_remove")
+    builder.button(text="🔙 Main Menu", callback_data="back_main")
+    builder.adjust(2)
     
     text = "🚫 **Blacklist**\n\n"
     if blocked:
@@ -1394,21 +1190,20 @@ async def menu_blacklist(callback: CallbackQuery):
     else:
         text += "No users blacklisted."
     
-    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.message.edit_text(text, reply_markup=builder.as_markup())
     await callback.answer()
 
-@dp.callback_query_handler(lambda c: c.data == "blacklist_add")
+@router.callback_query(lambda c: c.data == "blacklist_add")
 @admin_callback
-async def blacklist_add_prompt(callback: CallbackQuery):
-    await BlacklistAdd.waiting_user_id.set()
+async def blacklist_add_prompt(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(BlacklistAdd.waiting_user_id)
     await callback.message.edit_text(
-        "🚫 **Add to Blacklist**\n\n"
-        "Enter the **User ID** to block:",
+        "🚫 **Add to Blacklist**\n\nEnter the **User ID** to block:",
         reply_markup=back_to_main_keyboard()
     )
     await callback.answer()
 
-@dp.message_handler(state=BlacklistAdd.waiting_user_id)
+@router.message(BlacklistAdd.waiting_user_id)
 @admin_only
 async def blacklist_add_user(message: types.Message, state: FSMContext):
     try:
@@ -1418,13 +1213,13 @@ async def blacklist_add_user(message: types.Message, state: FSMContext):
         return
     
     await state.update_data(user_id=user_id)
-    await BlacklistAdd.next()
+    await state.set_state(BlacklistAdd.waiting_reason)
     await message.reply(
         "📝 Enter the **reason** for blacklisting (or send `-` to skip):",
         reply_markup=back_to_main_keyboard()
     )
 
-@dp.message_handler(state=BlacklistAdd.waiting_reason)
+@router.message(BlacklistAdd.waiting_reason)
 @admin_only
 async def blacklist_add_reason(message: types.Message, state: FSMContext):
     reason = message.text.strip()
@@ -1434,64 +1229,59 @@ async def blacklist_add_reason(message: types.Message, state: FSMContext):
     data = await state.get_data()
     user_id = data['user_id']
     
-    conn = get_db()
-    c = conn.cursor()
-    c.execute(
-        "INSERT OR REPLACE INTO blacklist (user_id, reason, blocked_by) VALUES (?, ?, ?)",
-        (user_id, reason[:200], message.from_user.id)
-    )
-    conn.commit()
-    conn.close()
+    async with await get_db() as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO blacklist (user_id, reason, blocked_by) VALUES (?, ?, ?)",
+            (user_id, reason[:200], message.from_user.id)
+        )
+        await db.commit()
     
-    log_admin_action(message.from_user.id, "blacklist_add", f"user:{user_id}", reason[:100])
-    await state.finish()
+    await log_admin_action(message.from_user.id, "blacklist_add", f"user:{user_id}", reason[:100])
+    await state.clear()
     await message.reply(f"✅ User `{user_id}` added to blacklist.", reply_markup=main_menu_keyboard())
 
-@dp.callback_query_handler(lambda c: c.data == "blacklist_remove")
+@router.callback_query(lambda c: c.data == "blacklist_remove")
 @admin_callback
 async def blacklist_remove_prompt(callback: CallbackQuery):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT user_id FROM blacklist")
-    users = c.fetchall()
-    conn.close()
+    async with await get_db() as db:
+        cursor = await db.execute("SELECT user_id FROM blacklist")
+        users = await cursor.fetchall()
     
     if not users:
         await callback.answer("Blacklist is empty.", show_alert=True)
         return
     
-    kb = InlineKeyboardMarkup(row_width=1)
+    builder = InlineKeyboardBuilder()
     for u in users:
-        kb.add(InlineKeyboardButton(f"❌ {u['user_id']}", callback_data=f"blacklist_remove_{u['user_id']}"))
-    kb.add(InlineKeyboardButton("🔙 Back", callback_data="menu_blacklist"))
+        builder.button(text=f"❌ {u['user_id']}", callback_data=f"blacklist_remove_{u['user_id']}")
+    builder.button(text="🔙 Back", callback_data="menu_blacklist")
+    builder.adjust(1)
     
     await callback.message.edit_text(
         "➖ **Remove from Blacklist**\n\nSelect a user to unblock:",
-        reply_markup=kb
+        reply_markup=builder.as_markup()
     )
     await callback.answer()
 
-@dp.callback_query_handler(lambda c: c.data.startswith("blacklist_remove_"))
+@router.callback_query(lambda c: c.data.startswith("blacklist_remove_"))
 @admin_callback
 async def blacklist_remove_execute(callback: CallbackQuery):
     user_id = int(callback.data.split("_")[2])
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("DELETE FROM blacklist WHERE user_id = ?", (user_id,))
-    conn.commit()
-    conn.close()
+    async with await get_db() as db:
+        await db.execute("DELETE FROM blacklist WHERE user_id = ?", (user_id,))
+        await db.commit()
     
-    log_admin_action(callback.from_user.id, "blacklist_remove", f"user:{user_id}")
+    await log_admin_action(callback.from_user.id, "blacklist_remove", f"user:{user_id}")
     await callback.answer(f"User {user_id} removed from blacklist.", show_alert=True)
     await menu_blacklist(callback)
 
 # =================================================================================
 #                                    BROADCAST
 # =================================================================================
-@dp.callback_query_handler(lambda c: c.data == "menu_broadcast")
+@router.callback_query(lambda c: c.data == "menu_broadcast")
 @admin_callback
-async def menu_broadcast(callback: CallbackQuery):
-    await Broadcast.waiting_message.set()
+async def menu_broadcast(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(Broadcast.waiting_message)
     await callback.message.edit_text(
         "📢 **Broadcast Message**\n\n"
         "Send the message you want to broadcast to **all users with active keys**.\n"
@@ -1501,38 +1291,36 @@ async def menu_broadcast(callback: CallbackQuery):
     )
     await callback.answer()
 
-@dp.message_handler(state=Broadcast.waiting_message)
+@router.message(Broadcast.waiting_message)
 @admin_only
 async def broadcast_preview(message: types.Message, state: FSMContext):
     msg_text = message.text
     await state.update_data(message=msg_text)
     
-    # Count recipients
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT DISTINCT issued_to FROM core_keys WHERE is_active = 1 AND expiry > datetime('now')")
-    recipients = [row[0] for row in c.fetchall()]
-    conn.close()
+    async with await get_db() as db:
+        cursor = await db.execute(
+            "SELECT DISTINCT issued_to FROM core_keys WHERE is_active = 1 AND expiry > datetime('now')"
+        )
+        recipients = [row[0] for row in await cursor.fetchall()]
     
     await state.update_data(recipients=recipients)
     
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("✅ Send Now", callback_data="broadcast_send"),
-        InlineKeyboardButton("✏️ Edit Message", callback_data="broadcast_edit"),
-        InlineKeyboardButton("❌ Cancel", callback_data="back_main")
-    )
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Send Now", callback_data="broadcast_send")
+    builder.button(text="✏️ Edit Message", callback_data="broadcast_edit")
+    builder.button(text="❌ Cancel", callback_data="back_main")
+    builder.adjust(2)
     
     await message.reply(
         f"📢 **Broadcast Preview**\n\n"
         f"Recipients: {len(recipients)} users\n\n"
         f"Message:\n{msg_text}\n\n"
         f"Send?",
-        reply_markup=kb
+        reply_markup=builder.as_markup()
     )
-    await Broadcast.waiting_confirm.set()
+    await state.set_state(Broadcast.waiting_confirm)
 
-@dp.callback_query_handler(lambda c: c.data == "broadcast_send", state=Broadcast.waiting_confirm)
+@router.callback_query(lambda c: c.data == "broadcast_send", state=Broadcast.waiting_confirm)
 @admin_callback
 async def broadcast_send(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
@@ -1548,216 +1336,139 @@ async def broadcast_send(callback: CallbackQuery, state: FSMContext):
         except Exception:
             failed += 1
     
-    # Log
-    conn = get_db()
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO broadcast_history (admin_id, message, recipients, successful, failed) VALUES (?, ?, ?, ?, ?)",
-        (callback.from_user.id, msg_text[:200], len(recipients), sent, failed)
-    )
-    conn.commit()
-    conn.close()
+    async with await get_db() as db:
+        await db.execute(
+            "INSERT INTO broadcast_history (admin_id, message, recipients, successful, failed) VALUES (?, ?, ?, ?, ?)",
+            (callback.from_user.id, msg_text[:200], len(recipients), sent, failed)
+        )
+        await db.commit()
     
-    log_admin_action(callback.from_user.id, "broadcast", f"recipients:{len(recipients)}", f"sent:{sent} failed:{failed}")
-    
-    await state.finish()
+    await log_admin_action(callback.from_user.id, "broadcast", f"recipients:{len(recipients)}", f"sent:{sent} failed:{failed}")
+    await state.clear()
     await callback.message.edit_text(
-        f"✅ **Broadcast sent**\n\n"
-        f"📨 Delivered: {sent}\n"
-        f"❌ Failed: {failed}",
+        f"✅ **Broadcast sent**\n\n📨 Delivered: {sent}\n❌ Failed: {failed}",
         reply_markup=main_menu_keyboard()
     )
     await callback.answer()
 
-@dp.callback_query_handler(lambda c: c.data == "broadcast_edit", state=Broadcast.waiting_confirm)
+@router.callback_query(lambda c: c.data == "broadcast_edit", state=Broadcast.waiting_confirm)
 @admin_callback
 async def broadcast_edit(callback: CallbackQuery, state: FSMContext):
-    await Broadcast.waiting_message.set()
+    await state.set_state(Broadcast.waiting_message)
     await callback.message.edit_text(
-        "📢 **Edit Broadcast Message**\n\n"
-        "Send the new message:",
+        "📢 **Edit Broadcast Message**\n\nSend the new message:",
         reply_markup=back_to_main_keyboard()
     )
     await callback.answer()
 
 # =================================================================================
-#                                    CLEANUP (ADVANCED)
+#                                    CLEANUP
 # =================================================================================
-@dp.callback_query_handler(lambda c: c.data == "menu_cleanup")
+@router.callback_query(lambda c: c.data == "menu_cleanup")
 @admin_callback
 async def menu_cleanup(callback: CallbackQuery):
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("🗑 Delete Expired Keys", callback_data="cleanup_expired"),
-        InlineKeyboardButton("💤 Deactivate Stale Instances", callback_data="cleanup_stale"),
-        InlineKeyboardButton("🧹 Full Cleanup", callback_data="cleanup_full"),
-        InlineKeyboardButton("📅 Auto-Cleanup Settings", callback_data="cleanup_settings")
-    )
-    kb.add(InlineKeyboardButton("🔙 Main Menu", callback_data="back_main"))
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🗑 Delete Expired Keys", callback_data="cleanup_expired")
+    builder.button(text="💤 Deactivate Stale Instances", callback_data="cleanup_stale")
+    builder.button(text="🧹 Full Cleanup", callback_data="cleanup_full")
+    builder.button(text="🔙 Main Menu", callback_data="back_main")
+    builder.adjust(2)
     
     await callback.message.edit_text(
-        "🧹 **Cleanup Tools**\n\n"
-        "Choose an action:",
-        reply_markup=kb
+        "🧹 **Cleanup Tools**\n\nChoose an action:",
+        reply_markup=builder.as_markup()
     )
     await callback.answer()
 
-@dp.callback_query_handler(lambda c: c.data == "cleanup_expired")
+@router.callback_query(lambda c: c.data == "cleanup_expired")
 @admin_callback
 async def cleanup_expired(callback: CallbackQuery):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("DELETE FROM core_keys WHERE expiry < datetime('now')")
-    deleted = c.rowcount
-    c.execute("INSERT INTO admin_logs (admin_id, action, target, details) VALUES (?, ?, ?, ?)",
-              (callback.from_user.id, "cleanup", "expired_keys", f"deleted:{deleted}"))
-    conn.commit()
-    conn.close()
+    async with await get_db() as db:
+        await db.execute("DELETE FROM core_keys WHERE expiry < datetime('now')")
+        deleted = db.total_changes
+        await db.commit()
+        await log_admin_action(callback.from_user.id, "cleanup", "expired_keys", f"deleted:{deleted}")
     
     await callback.answer(f"✅ {deleted} expired keys deleted.", show_alert=True)
     await menu_cleanup(callback)
 
-@dp.callback_query_handler(lambda c: c.data == "cleanup_stale")
+@router.callback_query(lambda c: c.data == "cleanup_stale")
 @admin_callback
 async def cleanup_stale(callback: CallbackQuery):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("""
-        UPDATE user_instances SET is_active = 0
-        WHERE last_heartbeat < datetime('now', '-10 minutes')
-    """)
-    deactivated = c.rowcount
-    c.execute("INSERT INTO admin_logs (admin_id, action, target, details) VALUES (?, ?, ?, ?)",
-              (callback.from_user.id, "cleanup", "stale_instances", f"deactivated:{deactivated}"))
-    conn.commit()
-    conn.close()
+    async with await get_db() as db:
+        await db.execute("""
+            UPDATE user_instances SET is_active = 0
+            WHERE last_heartbeat < datetime('now', '-10 minutes')
+        """)
+        deactivated = db.total_changes
+        await db.commit()
+        await log_admin_action(callback.from_user.id, "cleanup", "stale_instances", f"deactivated:{deactivated}")
     
     await callback.answer(f"✅ {deactivated} stale instances deactivated.", show_alert=True)
     await menu_cleanup(callback)
 
-@dp.callback_query_handler(lambda c: c.data == "cleanup_full")
+@router.callback_query(lambda c: c.data == "cleanup_full")
 @admin_callback
 async def cleanup_full(callback: CallbackQuery):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("DELETE FROM core_keys WHERE expiry < datetime('now')")
-    deleted_keys = c.rowcount
-    c.execute("""
-        UPDATE user_instances SET is_active = 0
-        WHERE last_heartbeat < datetime('now', '-10 minutes')
-    """)
-    deactivated = c.rowcount
-    c.execute("INSERT INTO admin_logs (admin_id, action, target, details) VALUES (?, ?, ?, ?)",
-              (callback.from_user.id, "cleanup", "full", f"keys:{deleted_keys} instances:{deactivated}"))
-    conn.commit()
-    conn.close()
+    async with await get_db() as db:
+        await db.execute("DELETE FROM core_keys WHERE expiry < datetime('now')")
+        deleted_keys = db.total_changes
+        await db.execute("""
+            UPDATE user_instances SET is_active = 0
+            WHERE last_heartbeat < datetime('now', '-10 minutes')
+        """)
+        deactivated = db.total_changes
+        await db.commit()
+        await log_admin_action(callback.from_user.id, "cleanup", "full", f"keys:{deleted_keys} instances:{deactivated}")
     
     await callback.answer(f"✅ Full cleanup: {deleted_keys} keys, {deactivated} instances.", show_alert=True)
     await menu_cleanup(callback)
 
-@dp.callback_query_handler(lambda c: c.data == "cleanup_settings")
-@admin_callback
-async def cleanup_settings(callback: CallbackQuery):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT task_name, interval_minutes, is_enabled FROM scheduled_tasks WHERE task_name IN ('auto_cleanup', 'auto_backup')")
-    tasks = c.fetchall()
-    conn.close()
-    
-    text = "⚙️ **Auto-Cleanup Settings**\n\n"
-    for t in tasks:
-        status = "✅ Enabled" if t['is_enabled'] else "❌ Disabled"
-        text += f"• {t['task_name']}: interval {t['interval_minutes']} min ({status})\n"
-    
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("🔄 Toggle Auto-Cleanup", callback_data="toggle_task_auto_cleanup"),
-        InlineKeyboardButton("🔄 Toggle Auto-Backup", callback_data="toggle_task_auto_backup"),
-        InlineKeyboardButton("⏱ Set Cleanup Interval", callback_data="set_cleanup_interval")
-    )
-    kb.add(InlineKeyboardButton("🔙 Back", callback_data="menu_cleanup"))
-    
-    await callback.message.edit_text(text, reply_markup=kb)
-    await callback.answer()
-
-@dp.callback_query_handler(lambda c: c.data.startswith("toggle_task_"))
-@admin_callback
-async def toggle_task(callback: CallbackQuery):
-    task_name = callback.data[12:]  # remove "toggle_task_"
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("UPDATE scheduled_tasks SET is_enabled = NOT is_enabled WHERE task_name = ?", (task_name,))
-    conn.commit()
-    conn.close()
-    await callback.answer(f"{task_name} toggled.", show_alert=True)
-    await cleanup_settings(callback)
-
 # =================================================================================
 #                                    BACKUP & RESTORE
 # =================================================================================
-@dp.callback_query_handler(lambda c: c.data == "menu_backup")
+@router.callback_query(lambda c: c.data == "menu_backup")
 @admin_callback
 async def menu_backup(callback: CallbackQuery):
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("💾 Create Backup", callback_data="backup_create"),
-        InlineKeyboardButton("📂 List Backups", callback_data="backup_list"),
-        InlineKeyboardButton("🔄 Restore", callback_data="backup_restore"),
-        InlineKeyboardButton("⚙️ Auto-Backup Settings", callback_data="backup_settings")
-    )
-    kb.add(InlineKeyboardButton("🔙 Main Menu", callback_data="back_main"))
+    builder = InlineKeyboardBuilder()
+    builder.button(text="💾 Create Backup", callback_data="backup_create")
+    builder.button(text="📂 List Backups", callback_data="backup_list")
+    builder.button(text="🔄 Restore", callback_data="backup_restore")
+    builder.button(text="🔙 Main Menu", callback_data="back_main")
+    builder.adjust(2)
     
     await callback.message.edit_text(
-        "💾 **Backup & Restore**\n\n"
-        "Manage database backups.",
-        reply_markup=kb
+        "💾 **Backup & Restore**\n\nManage database backups.",
+        reply_markup=builder.as_markup()
     )
     await callback.answer()
 
-async def create_backup(message: Union[types.Message, CallbackQuery], is_callback: bool = False):
+@router.callback_query(lambda c: c.data == "backup_create")
+@admin_callback
+async def backup_create(callback: CallbackQuery):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_file = os.path.join(BACKUP_DIR, f"backup_{timestamp}.db")
     
-    # Copy current database
-    import shutil
     shutil.copy2(DATABASE_PATH, backup_file)
     
-    # Also export metadata
     metadata = {
         "timestamp": timestamp,
-        "created_by": message.from_user.id if isinstance(message, types.Message) else message.from_user.id,
+        "created_by": callback.from_user.id,
         "database": DATABASE_PATH,
-        "tables": ["core_keys", "user_instances", "admin_logs", "blacklist", "key_templates", "broadcast_history", "scheduled_tasks"]
     }
     with open(backup_file + ".meta.json", 'w') as f:
         json.dump(metadata, f, indent=2)
     
-    log_admin_action(
-        message.from_user.id if isinstance(message, types.Message) else message.from_user.id,
-        "backup",
-        f"file:{backup_file}"
-    )
+    await log_admin_action(callback.from_user.id, "backup", f"file:{backup_file}")
     
-    caption = f"✅ Backup created: `{backup_file}`\nSize: {os.path.getsize(backup_file)} bytes"
-    
-    if is_callback:
-        await message.message.reply_document(
-            types.InputFile(backup_file, filename=f"backup_{timestamp}.db"),
-            caption=caption
+    with open(backup_file, 'rb') as f:
+        await callback.message.reply_document(
+            types.BufferedInputFile(f.read(), filename=f"backup_{timestamp}.db"),
+            caption=f"✅ Backup created: `{backup_file}`"
         )
-        await message.answer("Backup file sent.", show_alert=True)
-    else:
-        await message.reply_document(
-            types.InputFile(backup_file, filename=f"backup_{timestamp}.db"),
-            caption=caption
-        )
+    await callback.answer("Backup file sent.", show_alert=True)
 
-@dp.callback_query_handler(lambda c: c.data == "backup_create")
-@admin_callback
-async def backup_create(callback: CallbackQuery):
-    await create_backup(callback, is_callback=True)
-
-@dp.callback_query_handler(lambda c: c.data == "backup_list")
+@router.callback_query(lambda c: c.data == "backup_list")
 @admin_callback
 async def backup_list(callback: CallbackQuery):
     backups = sorted(os.listdir(BACKUP_DIR), reverse=True)
@@ -1769,22 +1480,23 @@ async def backup_list(callback: CallbackQuery):
         return
     
     text = "📂 **Available Backups**\n\n"
-    for b in db_backups:
+    for b in db_backups[:10]:
         size = os.path.getsize(os.path.join(BACKUP_DIR, b))
         text += f"• `{b}` ({size} bytes)\n"
     
-    kb = InlineKeyboardMarkup(row_width=1)
-    for b in db_backups[:5]:  # limit to 5 to avoid huge keyboard
-        kb.add(InlineKeyboardButton(f"📥 {b}", callback_data=f"backup_download_{b}"))
-    kb.add(InlineKeyboardButton("🔙 Back", callback_data="menu_backup"))
+    builder = InlineKeyboardBuilder()
+    for b in db_backups[:5]:
+        builder.button(text=f"📥 {b[:20]}", callback_data=f"backup_download_{b}")
+    builder.button(text="🔙 Back", callback_data="menu_backup")
+    builder.adjust(1)
     
-    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.message.edit_text(text, reply_markup=builder.as_markup())
     await callback.answer()
 
-@dp.callback_query_handler(lambda c: c.data.startswith("backup_download_"))
+@router.callback_query(lambda c: c.data.startswith("backup_download_"))
 @admin_callback
 async def backup_download(callback: CallbackQuery):
-    filename = callback.data[16:]  # remove "backup_download_"
+    filename = callback.data[16:]
     filepath = os.path.join(BACKUP_DIR, filename)
     if not os.path.exists(filepath):
         await callback.answer("File not found.", show_alert=True)
@@ -1792,12 +1504,12 @@ async def backup_download(callback: CallbackQuery):
     
     with open(filepath, 'rb') as f:
         await callback.message.reply_document(
-            types.InputFile(f, filename=filename),
+            types.BufferedInputFile(f.read(), filename=filename),
             caption=f"📥 Backup: {filename}"
         )
     await callback.answer()
 
-@dp.callback_query_handler(lambda c: c.data == "backup_restore")
+@router.callback_query(lambda c: c.data == "backup_restore")
 @admin_callback
 async def backup_restore_prompt(callback: CallbackQuery):
     backups = sorted(os.listdir(BACKUP_DIR), reverse=True)
@@ -1808,139 +1520,77 @@ async def backup_restore_prompt(callback: CallbackQuery):
         await callback.answer()
         return
     
-    kb = InlineKeyboardMarkup(row_width=1)
+    builder = InlineKeyboardBuilder()
     for b in db_backups:
-        kb.add(InlineKeyboardButton(f"⚠️ Restore {b}", callback_data=f"backup_restore_confirm_{b}"))
-    kb.add(InlineKeyboardButton("🔙 Cancel", callback_data="menu_backup"))
+        builder.button(text=f"⚠️ Restore {b[:20]}", callback_data=f"backup_restore_confirm_{b}")
+    builder.button(text="🔙 Cancel", callback_data="menu_backup")
+    builder.adjust(1)
     
     await callback.message.edit_text(
         "⚠️ **Restore Database**\n\n"
         "This will overwrite the current database with the selected backup.\n"
         "**This action is irreversible!**\n\n"
         "Select a backup:",
-        reply_markup=kb
+        reply_markup=builder.as_markup()
     )
     await callback.answer()
 
-@dp.callback_query_handler(lambda c: c.data.startswith("backup_restore_confirm_"))
+@router.callback_query(lambda c: c.data.startswith("backup_restore_confirm_"))
 @admin_callback
 async def backup_restore_execute(callback: CallbackQuery):
-    filename = callback.data[23:]  # remove "backup_restore_confirm_"
+    filename = callback.data[23:]
     filepath = os.path.join(BACKUP_DIR, filename)
     
     if not os.path.exists(filepath):
         await callback.answer("Backup file not found.", show_alert=True)
         return
     
-    # Create a backup of current DB before restore
+    # Pre-restore backup
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    pre_restore_backup = os.path.join(BACKUP_DIR, f"pre_restore_{timestamp}.db")
-    import shutil
-    shutil.copy2(DATABASE_PATH, pre_restore_backup)
+    pre_restore = os.path.join(BACKUP_DIR, f"pre_restore_{timestamp}.db")
+    shutil.copy2(DATABASE_PATH, pre_restore)
     
     # Restore
     shutil.copy2(filepath, DATABASE_PATH)
     
-    log_admin_action(callback.from_user.id, "restore", f"from:{filename}", f"pre_backup:{pre_restore_backup}")
+    await log_admin_action(callback.from_user.id, "restore", f"from:{filename}", f"pre_backup:{pre_restore}")
     
     await callback.message.edit_text(
         f"✅ Database restored from `{filename}`.\n"
-        f"A backup of the previous database was saved as `{pre_restore_backup}`.",
+        f"A backup of the previous database was saved as `{pre_restore}`.",
         reply_markup=main_menu_keyboard()
     )
     await callback.answer()
 
-@dp.callback_query_handler(lambda c: c.data == "backup_settings")
-@admin_callback
-async def backup_settings(callback: CallbackQuery):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT interval_minutes, is_enabled FROM scheduled_tasks WHERE task_name = 'auto_backup'")
-    task = c.fetchone()
-    conn.close()
-    
-    status = "✅ Enabled" if task['is_enabled'] else "❌ Disabled"
-    text = (
-        "⚙️ **Auto-Backup Settings**\n\n"
-        f"Interval: {task['interval_minutes']} minutes\n"
-        f"Status: {status}\n\n"
-        "Use buttons to change."
-    )
-    
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("🔄 Toggle", callback_data="toggle_task_auto_backup"),
-        InlineKeyboardButton("⏱ Set Interval", callback_data="set_backup_interval"),
-        InlineKeyboardButton("🔙 Back", callback_data="menu_backup")
-    )
-    
-    await callback.message.edit_text(text, reply_markup=kb)
-    await callback.answer()
-
-@dp.callback_query_handler(lambda c: c.data == "set_backup_interval")
-@admin_callback
-async def set_backup_interval_prompt(callback: CallbackQuery, state: FSMContext):
-    await state.set_state("set_backup_interval")
-    await callback.message.edit_text(
-        "⏱ Enter the new interval in **minutes** (e.g., 1440 for daily):",
-        reply_markup=back_to_main_keyboard()
-    )
-    await callback.answer()
-
-@dp.message_handler(state="set_backup_interval")
-@admin_only
-async def set_backup_interval_save(message: types.Message, state: FSMContext):
-    try:
-        minutes = int(message.text.strip())
-        if minutes <= 0:
-            raise ValueError
-    except ValueError:
-        await message.reply("❌ Please enter a positive integer.")
-        return
-    
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("UPDATE scheduled_tasks SET interval_minutes = ? WHERE task_name = 'auto_backup'", (minutes,))
-    conn.commit()
-    conn.close()
-    
-    log_admin_action(message.from_user.id, "settings", "auto_backup_interval", f"{minutes} min")
-    await state.finish()
-    await message.reply(f"✅ Auto-backup interval set to {minutes} minutes.", reply_markup=main_menu_keyboard())
-
 # =================================================================================
-#                                    EXPORT KEYS (CSV + JSON)
+#                                    EXPORT KEYS
 # =================================================================================
-@dp.callback_query_handler(lambda c: c.data == "menu_export")
+@router.callback_query(lambda c: c.data == "menu_export")
 @admin_callback
 async def menu_export(callback: CallbackQuery):
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("📄 Export as JSON", callback_data="export_json"),
-        InlineKeyboardButton("📊 Export as CSV", callback_data="export_csv"),
-        InlineKeyboardButton("📋 Export Active Keys", callback_data="export_active"),
-        InlineKeyboardButton("📤 Export Full DB", callback_data="export_db")
-    )
-    kb.add(InlineKeyboardButton("🔙 Main Menu", callback_data="back_main"))
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📄 Export as JSON", callback_data="export_json")
+    builder.button(text="📊 Export as CSV", callback_data="export_csv")
+    builder.button(text="📋 Export Active Keys", callback_data="export_active")
+    builder.button(text="📤 Export Full DB", callback_data="export_db")
+    builder.button(text="🔙 Main Menu", callback_data="back_main")
+    builder.adjust(2)
     
     await callback.message.edit_text(
-        "📤 **Export Data**\n\n"
-        "Choose format:",
-        reply_markup=kb
+        "📤 **Export Data**\n\nChoose format:",
+        reply_markup=builder.as_markup()
     )
     await callback.answer()
 
-@dp.callback_query_handler(lambda c: c.data == "export_json")
+@router.callback_query(lambda c: c.data == "export_json")
 @admin_callback
 async def export_json(callback: CallbackQuery):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("""
-        SELECT key_id, issued_to, issued_by, max_instances, usage_count, expiry, note, created_at, is_active
-        FROM core_keys ORDER BY created_at DESC
-    """)
-    rows = c.fetchall()
-    conn.close()
+    async with await get_db() as db:
+        cursor = await db.execute("""
+            SELECT key_id, issued_to, issued_by, max_instances, usage_count, expiry, note, created_at, is_active
+            FROM core_keys ORDER BY created_at DESC
+        """)
+        rows = await cursor.fetchall()
     
     data = []
     for row in rows:
@@ -1959,28 +1609,21 @@ async def export_json(callback: CallbackQuery):
     json_str = json.dumps(data, indent=2, default=str)
     filename = f"keys_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     
-    with open(filename, 'w') as f:
-        f.write(json_str)
-    
-    with open(filename, 'rb') as f:
-        await callback.message.reply_document(
-            types.InputFile(f, filename=filename),
-            caption=f"📄 Exported {len(data)} keys."
-        )
-    os.remove(filename)
+    await callback.message.reply_document(
+        types.BufferedInputFile(json_str.encode(), filename=filename),
+        caption=f"📄 Exported {len(data)} keys."
+    )
     await callback.answer()
 
-@dp.callback_query_handler(lambda c: c.data == "export_csv")
+@router.callback_query(lambda c: c.data == "export_csv")
 @admin_callback
 async def export_csv(callback: CallbackQuery):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("""
-        SELECT key_id, issued_to, max_instances, usage_count, expiry, note, created_at
-        FROM core_keys ORDER BY created_at DESC
-    """)
-    rows = c.fetchall()
-    conn.close()
+    async with await get_db() as db:
+        cursor = await db.execute("""
+            SELECT key_id, issued_to, max_instances, usage_count, expiry, note, created_at
+            FROM core_keys ORDER BY created_at DESC
+        """)
+        rows = await cursor.fetchall()
     
     output = io.StringIO()
     writer = csv.writer(output)
@@ -2000,23 +1643,21 @@ async def export_csv(callback: CallbackQuery):
     filename = f"keys_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     
     await callback.message.reply_document(
-        types.InputFile(io.BytesIO(csv_data), filename=filename),
+        types.BufferedInputFile(csv_data, filename=filename),
         caption=f"📊 Exported {len(rows)} keys."
     )
     await callback.answer()
 
-@dp.callback_query_handler(lambda c: c.data == "export_active")
+@router.callback_query(lambda c: c.data == "export_active")
 @admin_callback
 async def export_active(callback: CallbackQuery):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("""
-        SELECT key_id, issued_to, max_instances, usage_count, expiry, note
-        FROM core_keys WHERE is_active = 1 AND expiry > datetime('now')
-        ORDER BY created_at DESC
-    """)
-    rows = c.fetchall()
-    conn.close()
+    async with await get_db() as db:
+        cursor = await db.execute("""
+            SELECT key_id, issued_to, max_instances, usage_count, expiry, note
+            FROM core_keys WHERE is_active = 1 AND expiry > datetime('now')
+            ORDER BY created_at DESC
+        """)
+        rows = await cursor.fetchall()
     
     output = io.StringIO()
     writer = csv.writer(output)
@@ -2035,18 +1676,17 @@ async def export_active(callback: CallbackQuery):
     filename = f"active_keys_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     
     await callback.message.reply_document(
-        types.InputFile(io.BytesIO(csv_data), filename=filename),
+        types.BufferedInputFile(csv_data, filename=filename),
         caption=f"📋 Exported {len(rows)} active keys."
     )
     await callback.answer()
 
-@dp.callback_query_handler(lambda c: c.data == "export_db")
+@router.callback_query(lambda c: c.data == "export_db")
 @admin_callback
 async def export_db(callback: CallbackQuery):
-    # Send the entire SQLite database file
     with open(DATABASE_PATH, 'rb') as f:
         await callback.message.reply_document(
-            types.InputFile(f, filename=f"admin_bot_full_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"),
+            types.BufferedInputFile(f.read(), filename=f"admin_bot_full_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"),
             caption="📦 Full database export."
         )
     await callback.answer()
@@ -2054,24 +1694,22 @@ async def export_db(callback: CallbackQuery):
 # =================================================================================
 #                                    LOGS VIEWER
 # =================================================================================
-@dp.callback_query_handler(lambda c: c.data.startswith("menu_logs_"))
+@router.callback_query(lambda c: c.data.startswith("menu_logs_"))
 @admin_callback
 async def menu_logs(callback: CallbackQuery):
     page = int(callback.data.split("_")[2])
     per_page = 15
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("""
-        SELECT timestamp, admin_id, action, target, details
-        FROM admin_logs
-        ORDER BY timestamp DESC
-        LIMIT ? OFFSET ?
-    """, (per_page, page * per_page))
-    logs = c.fetchall()
     
-    c.execute("SELECT COUNT(*) FROM admin_logs")
-    total = c.fetchone()[0]
-    conn.close()
+    async with await get_db() as db:
+        cursor = await db.execute("""
+            SELECT timestamp, admin_id, action, target, details
+            FROM admin_logs
+            ORDER BY timestamp DESC
+            LIMIT ? OFFSET ?
+        """, (per_page, page * per_page))
+        logs = await cursor.fetchall()
+        
+        total = (await db.execute_fetchone("SELECT COUNT(*) FROM admin_logs"))[0]
     
     total_pages = (total + per_page - 1) // per_page
     
@@ -2089,31 +1727,15 @@ async def menu_logs(callback: CallbackQuery):
         text += "\n"
     
     kb = pagination_keyboard("menu_logs", page, total_pages)
-    kb.row(InlineKeyboardButton("🗑 Clear Logs", callback_data="logs_clear"))
-    
     await callback.message.edit_text(text, reply_markup=kb)
     await callback.answer()
-
-@dp.callback_query_handler(lambda c: c.data == "logs_clear")
-@admin_callback
-async def logs_clear(callback: CallbackQuery):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("DELETE FROM admin_logs")
-    conn.commit()
-    conn.close()
-    
-    log_admin_action(callback.from_user.id, "clear_logs", "all")
-    await callback.answer("All logs cleared.", show_alert=True)
-    await menu_logs(callback)
 
 # =================================================================================
 #                                    SETTINGS
 # =================================================================================
-@dp.callback_query_handler(lambda c: c.data == "menu_settings")
+@router.callback_query(lambda c: c.data == "menu_settings")
 @admin_callback
 async def menu_settings(callback: CallbackQuery):
-    # Get bot info
     me = await bot.get_me()
     
     text = (
@@ -2122,163 +1744,60 @@ async def menu_settings(callback: CallbackQuery):
         f"**Bot ID:** `{me.id}`\n"
         f"**Admin IDs:** {', '.join(map(str, ADMIN_IDS))}\n"
         f"**Database:** `{DATABASE_PATH}`\n"
-        f"**JWT Secret:** {'*' * 8}\n"
         f"**Backup Dir:** `{BACKUP_DIR}`\n"
-        f"**Log File:** `{LOG_FILE}`\n\n"
+        f"**Health Port:** `{HEALTH_CHECK_PORT}`\n\n"
         "**Actions:**"
     )
     
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("🔄 Restart Bot", callback_data="settings_restart"),
-        InlineKeyboardButton("📥 Download Logs", callback_data="settings_download_logs"),
-        InlineKeyboardButton("🧪 Test Broadcast", callback_data="settings_test"),
-        InlineKeyboardButton("🔙 Main Menu", callback_data="back_main")
-    )
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📥 Download Logs", callback_data="settings_download_logs")
+    builder.button(text="🧪 Test", callback_data="settings_test")
+    builder.button(text="🔙 Main Menu", callback_data="back_main")
+    builder.adjust(2)
     
-    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.message.edit_text(text, reply_markup=builder.as_markup())
     await callback.answer()
 
-@dp.callback_query_handler(lambda c: c.data == "settings_restart")
-@admin_callback
-async def settings_restart(callback: CallbackQuery):
-    await callback.answer("🔄 Restarting bot...", show_alert=True)
-    # Graceful restart
-    os.execl(sys.executable, sys.executable, *sys.argv)
-
-@dp.callback_query_handler(lambda c: c.data == "settings_download_logs")
+@router.callback_query(lambda c: c.data == "settings_download_logs")
 @admin_callback
 async def settings_download_logs(callback: CallbackQuery):
-    if os.path.exists(LOG_FILE):
-        with open(LOG_FILE, 'rb') as f:
+    if os.path.exists("admin_bot.log"):
+        with open("admin_bot.log", 'rb') as f:
             await callback.message.reply_document(
-                types.InputFile(f, filename=LOG_FILE),
+                types.BufferedInputFile(f.read(), filename="admin_bot.log"),
                 caption="📋 Bot log file."
             )
     else:
         await callback.answer("Log file not found.", show_alert=True)
     await callback.answer()
 
-@dp.callback_query_handler(lambda c: c.data == "settings_test")
+@router.callback_query(lambda c: c.data == "settings_test")
 @admin_callback
 async def settings_test(callback: CallbackQuery):
     await callback.answer("✅ Test successful!", show_alert=True)
 
 # =================================================================================
-#                                    SCHEDULED TASKS (ASYNC LOOP)
-# =================================================================================
-async def scheduled_worker():
-    """Background task to run scheduled operations."""
-    while True:
-        try:
-            conn = get_db()
-            c = conn.cursor()
-            c.execute("SELECT task_name, interval_minutes, last_run, is_enabled FROM scheduled_tasks")
-            tasks = c.fetchall()
-            conn.close()
-            
-            now = datetime.utcnow()
-            
-            for task in tasks:
-                if not task['is_enabled']:
-                    continue
-                
-                last_run = datetime.fromisoformat(task['last_run']) if task['last_run'] else None
-                interval = timedelta(minutes=task['interval_minutes'])
-                
-                if last_run is None or now - last_run >= interval:
-                    # Execute task
-                    if task['task_name'] == 'auto_cleanup':
-                        await auto_cleanup()
-                    elif task['task_name'] == 'auto_backup':
-                        await auto_backup()
-                    elif task['task_name'] == 'send_stats_report':
-                        await send_stats_report()
-                    
-                    # Update last_run
-                    conn = get_db()
-                    c = conn.cursor()
-                    c.execute("UPDATE scheduled_tasks SET last_run = ? WHERE task_name = ?",
-                              (now.isoformat(), task['task_name']))
-                    conn.commit()
-                    conn.close()
-            
-        except Exception as e:
-            logger.exception(f"Scheduled worker error: {e}")
-        
-        await asyncio.sleep(60)  # check every minute
-
-async def auto_cleanup():
-    """Delete expired keys and deactivate stale instances."""
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("DELETE FROM core_keys WHERE expiry < datetime('now')")
-    deleted_keys = c.rowcount
-    c.execute("""
-        UPDATE user_instances SET is_active = 0
-        WHERE last_heartbeat < datetime('now', '-10 minutes')
-    """)
-    deactivated = c.rowcount
-    conn.commit()
-    conn.close()
-    logger.info(f"Auto-cleanup: deleted {deleted_keys} keys, deactivated {deactivated} instances")
-
-async def auto_backup():
-    """Create automatic daily backup."""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_file = os.path.join(BACKUP_DIR, f"auto_backup_{timestamp}.db")
-    import shutil
-    shutil.copy2(DATABASE_PATH, backup_file)
-    logger.info(f"Auto-backup created: {backup_file}")
-
-async def send_stats_report():
-    """Send weekly statistics to admin."""
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM core_keys")
-    total_keys = c.fetchone()[0]
-    c.execute("SELECT COUNT(*) FROM user_instances WHERE is_active = 1")
-    active_instances = c.fetchone()[0]
-    conn.close()
-    
-    text = (
-        "📊 **Weekly Statistics Report**\n\n"
-        f"Total Keys: {total_keys}\n"
-        f"Active Instances: {active_instances}\n"
-        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-    )
-    for admin_id in ADMIN_IDS:
-        try:
-            await bot.send_message(admin_id, text)
-        except:
-            pass
-
-# =================================================================================
 #                                    ERROR HANDLER
 # =================================================================================
-@dp.errors_handler()
-async def errors_handler(update, exception):
-    logger.exception(f"Update {update} caused error {exception}")
+@dp.errors()
+async def errors_handler(event: types.ErrorEvent):
+    logger.exception(f"Update {event.update} caused error {event.exception}")
     return True
 
 # =================================================================================
-#                                    STARTUP & SHUTDOWN
+#                                    STARTUP
 # =================================================================================
-async def on_startup(dp):
-    logger.info("Starting Ultimate Admin Bot...")
-    # Start scheduled tasks
-    asyncio.create_task(scheduled_worker())
+async def on_startup():
+    await init_db()
+    asyncio.create_task(start_health_server())
+    logger.info("Bot started and health server running.")
 
-async def on_shutdown(dp):
-    logger.info("Shutting down...")
-    await dp.storage.close()
-    await dp.storage.wait_closed()
+async def main():
+    dp.startup.register(on_startup)
+    await dp.start_polling(bot)
 
-# =================================================================================
-#                                    MAIN
-# =================================================================================
 if __name__ == "__main__":
     logger.info("=" * 60)
-    logger.info("ULTIMATE ADMIN BOT STARTING")
+    logger.info("ULTIMATE ADMIN BOT STARTING (AIOGRAM V3)")
     logger.info("=" * 60)
-    executor.start_polling(dp, skip_updates=True, on_startup=on_startup, on_shutdown=on_shutdown)
+    asyncio.run(main())
