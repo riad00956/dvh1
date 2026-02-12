@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-                    ULTIMATE TELEGRAM ADMIN BOT – AIOGRAM V3
+        ULTIMATE TELEGRAM ADMIN BOT – AIOGRAM V3 – RENDER READY
 ================================================================================
 Hardcoded bot token & admin ID. Full inline keyboard navigation.
 SQLite database. JWT key generation. 50+ admin features.
-Built-in aiohttp health check server for Render.
-No Flask. No contrib. No bloat.
+Built-in aiohttp health check server on $PORT.
 ================================================================================
 """
 
@@ -19,24 +18,29 @@ import csv
 import io
 import logging
 import asyncio
-import secrets
 import shutil
 from datetime import datetime, timedelta
-from contextlib import closing
 from functools import wraps
-from typing import List, Dict, Tuple, Optional, Union
+from typing import Optional, Union
 
 import jwt
 import aiosqlite
 from aiohttp import web
+
 from aiogram import Bot, Dispatcher, types
+from aiogram.enums import ParseMode
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import ParseMode, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import (
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    CallbackQuery,
+    BufferedInputFile
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram import Router
-from aiogram.filters import Command
 
 # =================================================================================
 #                                    CONFIGURATION
@@ -49,7 +53,7 @@ BACKUP_DIR = "backups"
 HEALTH_CHECK_PORT = int(os.environ.get("PORT", 10000))  # Render port
 
 # =================================================================================
-#                                    LOGGING SETUP
+#                                    LOGGING
 # =================================================================================
 logging.basicConfig(
     level=logging.INFO,
@@ -64,7 +68,7 @@ logger = logging.getLogger(__name__)
 os.makedirs(BACKUP_DIR, exist_ok=True)
 
 # =================================================================================
-#                                    DATABASE INIT
+#                                    DATABASE INIT (AIOGRAM V3)
 # =================================================================================
 async def init_db():
     """Create all SQLite tables asynchronously."""
@@ -145,7 +149,6 @@ async def init_db():
             )
         """)
         
-        # Indexes
         await db.execute("CREATE INDEX IF NOT EXISTS idx_keys_issued_to ON core_keys(issued_to)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_keys_expiry ON core_keys(expiry)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_instances_user ON user_instances(user_id)")
@@ -154,9 +157,6 @@ async def init_db():
         await db.commit()
     logger.info("Database initialized.")
 
-# =================================================================================
-#                                    DATABASE HELPERS
-# =================================================================================
 async def get_db():
     """Return a new aiosqlite connection."""
     conn = await aiosqlite.connect(DATABASE_PATH)
@@ -176,7 +176,7 @@ async def log_admin_action(admin_id: int, action: str, target: str, details: str
 #                                    JWT HELPERS
 # =================================================================================
 def generate_jwt_key(user_id: int, days: int, max_instances: int, note: str = "", template: str = "") -> tuple:
-    """Generate a signed JWT Core Key and store in DB."""
+    """Generate a signed JWT Core Key."""
     key_id = str(uuid.uuid4())
     expiry = datetime.utcnow() + timedelta(days=days)
     payload = {
@@ -222,7 +222,7 @@ async def revoke_key(key_id: str, admin_id: int) -> bool:
     return True
 
 # =================================================================================
-#                                    BOT INITIALIZATION (AIOGRAM V3)
+#                                    BOT INIT – AIOGRAM V3
 # =================================================================================
 bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.MARKDOWN)
 storage = MemoryStorage()
@@ -247,7 +247,7 @@ async def start_health_server():
     logger.info(f"Health check server running on port {HEALTH_CHECK_PORT}")
 
 # =================================================================================
-#                                    FSM STATES
+#                                    FSM STATES – AIOGRAM V3
 # =================================================================================
 class KeyGeneration(StatesGroup):
     waiting_user_id = State()
@@ -381,7 +381,7 @@ async def paginate_keys(page: int = 0, per_page: int = 10, filter_expired: bool 
     return keys, total
 
 # =================================================================================
-#                                    COMMAND HANDLERS
+#                                    COMMAND HANDLERS – AIOGRAM V3
 # =================================================================================
 @router.message(Command("start"))
 @admin_only
@@ -434,8 +434,7 @@ async def noop(callback: CallbackQuery):
 # =================================================================================
 @router.callback_query(lambda c: c.data == "menu_genkey")
 @admin_callback
-async def menu_genkey(callback: CallbackQuery):
-    # Check if templates exist
+async def menu_genkey(callback: CallbackQuery, state: FSMContext):
     async with await get_db() as db:
         cursor = await db.execute("SELECT name FROM key_templates LIMIT 1")
         has_templates = await cursor.fetchone() is not None
@@ -526,7 +525,6 @@ async def process_user_id(message: types.Message, state: FSMContext):
         await message.reply("❌ Invalid ID. Please enter a numeric user ID.")
         return
     
-    # Check blacklist
     async with await get_db() as db:
         cursor = await db.execute("SELECT reason FROM blacklist WHERE user_id = ?", (user_id,))
         blocked = await cursor.fetchone()
@@ -635,7 +633,7 @@ async def process_note(message: types.Message, state: FSMContext):
 async def menu_listkeys(callback: CallbackQuery):
     page = int(callback.data.split("_")[2])
     keys, total = await paginate_keys(page, per_page=8)
-    total_pages = (total + 7) // 8
+    total_pages = (total + 7) // 8 if total else 1
     
     if not keys:
         await callback.message.edit_text(
@@ -771,7 +769,7 @@ async def menu_instances(callback: CallbackQuery):
         
         total = (await db.execute_fetchone("SELECT COUNT(*) FROM user_instances WHERE is_active = 1"))[0]
     
-    total_pages = (total + per_page - 1) // per_page
+    total_pages = (total + per_page - 1) // per_page if total else 1
     
     if not rows:
         await callback.message.edit_text(
@@ -859,7 +857,7 @@ async def confirm_revoke(callback: CallbackQuery):
     await callback.answer()
 
 # =================================================================================
-#                                    KEY EDIT (SIMPLIFIED)
+#                                    KEY EDIT
 # =================================================================================
 @router.callback_query(lambda c: c.data == "menu_edit")
 @admin_callback
@@ -1463,7 +1461,7 @@ async def backup_create(callback: CallbackQuery):
     
     with open(backup_file, 'rb') as f:
         await callback.message.reply_document(
-            types.BufferedInputFile(f.read(), filename=f"backup_{timestamp}.db"),
+            BufferedInputFile(f.read(), filename=f"backup_{timestamp}.db"),
             caption=f"✅ Backup created: `{backup_file}`"
         )
     await callback.answer("Backup file sent.", show_alert=True)
@@ -1504,7 +1502,7 @@ async def backup_download(callback: CallbackQuery):
     
     with open(filepath, 'rb') as f:
         await callback.message.reply_document(
-            types.BufferedInputFile(f.read(), filename=filename),
+            BufferedInputFile(f.read(), filename=filename),
             caption=f"📥 Backup: {filename}"
         )
     await callback.answer()
@@ -1610,7 +1608,7 @@ async def export_json(callback: CallbackQuery):
     filename = f"keys_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     
     await callback.message.reply_document(
-        types.BufferedInputFile(json_str.encode(), filename=filename),
+        BufferedInputFile(json_str.encode(), filename=filename),
         caption=f"📄 Exported {len(data)} keys."
     )
     await callback.answer()
@@ -1643,7 +1641,7 @@ async def export_csv(callback: CallbackQuery):
     filename = f"keys_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     
     await callback.message.reply_document(
-        types.BufferedInputFile(csv_data, filename=filename),
+        BufferedInputFile(csv_data, filename=filename),
         caption=f"📊 Exported {len(rows)} keys."
     )
     await callback.answer()
@@ -1676,7 +1674,7 @@ async def export_active(callback: CallbackQuery):
     filename = f"active_keys_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     
     await callback.message.reply_document(
-        types.BufferedInputFile(csv_data, filename=filename),
+        BufferedInputFile(csv_data, filename=filename),
         caption=f"📋 Exported {len(rows)} active keys."
     )
     await callback.answer()
@@ -1686,7 +1684,7 @@ async def export_active(callback: CallbackQuery):
 async def export_db(callback: CallbackQuery):
     with open(DATABASE_PATH, 'rb') as f:
         await callback.message.reply_document(
-            types.BufferedInputFile(f.read(), filename=f"admin_bot_full_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"),
+            BufferedInputFile(f.read(), filename=f"admin_bot_full_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"),
             caption="📦 Full database export."
         )
     await callback.answer()
@@ -1711,7 +1709,7 @@ async def menu_logs(callback: CallbackQuery):
         
         total = (await db.execute_fetchone("SELECT COUNT(*) FROM admin_logs"))[0]
     
-    total_pages = (total + per_page - 1) // per_page
+    total_pages = (total + per_page - 1) // per_page if total else 1
     
     if not logs:
         await callback.message.edit_text("No logs found.", reply_markup=main_menu_keyboard())
@@ -1764,7 +1762,7 @@ async def settings_download_logs(callback: CallbackQuery):
     if os.path.exists("admin_bot.log"):
         with open("admin_bot.log", 'rb') as f:
             await callback.message.reply_document(
-                types.BufferedInputFile(f.read(), filename="admin_bot.log"),
+                BufferedInputFile(f.read(), filename="admin_bot.log"),
                 caption="📋 Bot log file."
             )
     else:
@@ -1779,8 +1777,8 @@ async def settings_test(callback: CallbackQuery):
 # =================================================================================
 #                                    ERROR HANDLER
 # =================================================================================
-@dp.errors()
-async def errors_handler(event: types.ErrorEvent):
+@dp.error()
+async def error_handler(event: types.ErrorEvent):
     logger.exception(f"Update {event.update} caused error {event.exception}")
     return True
 
@@ -1798,6 +1796,6 @@ async def main():
 
 if __name__ == "__main__":
     logger.info("=" * 60)
-    logger.info("ULTIMATE ADMIN BOT STARTING (AIOGRAM V3)")
+    logger.info("ULTIMATE ADMIN BOT STARTING (AIOGRAM V3) – RENDER READY")
     logger.info("=" * 60)
     asyncio.run(main())
