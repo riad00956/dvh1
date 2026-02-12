@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
 ================================================================================
-        ULTIMATE TELEGRAM ADMIN BOT – AIOGRAM V3 – RENDER READY
+        ULTIMATE TELEGRAM ADMIN BOT – AIOGRAM 3.7+ – RENDER READY
 ================================================================================
 Hardcoded bot token & admin ID. Full inline keyboard navigation.
 SQLite database. JWT key generation. 50+ admin features.
 Built-in aiohttp health check server on $PORT.
+Fully compatible with aiogram 3.7+ (DefaultBotProperties).
 ================================================================================
 """
 
@@ -29,6 +30,7 @@ from aiohttp import web
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties  # CRITICAL FIX for aiogram 3.7+
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -222,9 +224,12 @@ async def revoke_key(key_id: str, admin_id: int) -> bool:
     return True
 
 # =================================================================================
-#                                    BOT INIT – AIOGRAM V3
+#                                    BOT INIT – AIOGRAM 3.7+ (FIXED)
 # =================================================================================
-bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.MARKDOWN)
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN)  # ✅ CORRECT
+)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 router = Router()
@@ -1796,6 +1801,6 @@ async def main():
 
 if __name__ == "__main__":
     logger.info("=" * 60)
-    logger.info("ULTIMATE ADMIN BOT STARTING (AIOGRAM V3) – RENDER READY")
+    logger.info("ULTIMATE ADMIN BOT – AIOGRAM 3.7+ – RENDER READY")
     logger.info("=" * 60)
     asyncio.run(main())
