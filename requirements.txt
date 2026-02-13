@@ -1,8 +1,8 @@
 pyTelegramBotAPI==4.14.0
 python-dotenv==1.0.0
-flask==2.3.3
-flask-socketio==5.3.4
+Flask==2.3.3
+Flask-SocketIO==5.3.4
 python-socketio==5.9.0
 eventlet==0.33.3
-werkzeug==2.3.7
+Werkzeug==2.3.7
 psutil==5.9.5
