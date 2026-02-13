@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Telegram Personal VPS Bot – Public Edition
-- Publicly accessible file servers (0.0.0.0) with public IP
-- Beautiful HTML file manager (upload, download, delete)
-- Full database logging of file operations
-- Admin controls for port range & public host
-- Scales to 1000+ instances
+Telegram VPS Bot – Bangladesh Edition
+- Webhook mode (no 409 conflict)
+- Custom login page (index.html)
+- Public file servers with cookie‑based session
+- Full admin control, renewal, user blocking, port range
 """
 
 import os
@@ -21,9 +20,11 @@ import string
 import time
 import signal
 import subprocess
+import hashlib
+import hmac
 from datetime import datetime, timedelta
 from functools import wraps
-from http.server import HTTPServer, SimpleHTTPRequestHandler
+from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, unquote
 import base64
 import html
@@ -34,7 +35,8 @@ from dotenv import load_dotenv, set_key
 import telebot
 from telebot.types import (
     ReplyKeyboardMarkup, KeyboardButton,
-    InlineKeyboardMarkup, InlineKeyboardButton
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    Update
 )
 from flask import Flask, request, session, redirect, url_for, send_file, abort, render_template_string
 
@@ -55,7 +57,7 @@ except ImportError:
 ENV_FILE = ".env"
 load_dotenv(ENV_FILE)
 
-# Provided credentials
+# Provided credentials (used as fallback)
 DEFAULT_BOT_TOKEN = "8011804210:AAE--NiCSKKjbX4TC3nJVxuW64Fu53Ywh0w"
 DEFAULT_OWNER_ID = 8373846582
 
@@ -80,17 +82,24 @@ if not INSTANCE_SECRET:
     INSTANCE_SECRET = str(uuid.uuid4())
     set_key(ENV_FILE, "INSTANCE_SECRET", INSTANCE_SECRET)
 
-# Flask admin port
-ADMIN_PORT = int(os.getenv("ADMIN_PORT", 5000))
+# Flask ports
+WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", 8443))   # Telegram webhook receiver
+ADMIN_PORT = int(os.getenv("ADMIN_PORT", 5000))       # Admin panel
 
-# Default port range – now wide enough for 1000+ instances
+# Public webhook URL (must be set manually or via --public-url)
+PUBLIC_URL = os.getenv("PUBLIC_URL", "")
+
+# Default port range for file servers
 DEFAULT_PORT_MIN = 2000
-DEFAULT_PORT_MAX = 3000   # 1001 ports
+DEFAULT_PORT_MAX = 3000
 PORT_MIN = int(os.getenv("PORT_MIN", DEFAULT_PORT_MIN))
 PORT_MAX = int(os.getenv("PORT_MAX", DEFAULT_PORT_MAX))
 
-# Public host / IP (auto‑detected if not set)
+# Public host (auto‑detected)
 PUBLIC_HOST = os.getenv("PUBLIC_HOST", "")
+
+# Path to custom login page
+LOGIN_PAGE = "index.html"   # will be served by file servers
 
 # Database
 DB_FILE = f"instance_{INSTANCE_ID}.db"
@@ -200,12 +209,10 @@ def set_setting(key, value):
     with get_db() as conn:
         conn.execute("REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
         conn.commit()
-    # Also update .env for persistence
     set_key(ENV_FILE, key.upper(), str(value))
 
 # ---------- Public IP / Host ----------
 def detect_public_ip():
-    """Auto‑detect public IP using external service."""
     if REQUESTS_AVAILABLE:
         try:
             ip = requests.get('https://api.ipify.org', timeout=5).text.strip()
@@ -213,7 +220,6 @@ def detect_public_ip():
                 return ip
         except:
             pass
-    # Fallback: get local IP
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -224,11 +230,10 @@ def detect_public_ip():
         return "YOUR_PUBLIC_IP"
 
 def get_public_host():
-    """Return the public host to display in URLs."""
     host = get_setting("public_host", "")
     if not host:
         host = detect_public_ip()
-        set_setting("public_host", host)  # cache it
+        set_setting("public_host", host)
     return host
 
 # ---------- Core Keys ----------
@@ -255,11 +260,6 @@ def increment_key_usage(key_id):
             conn.execute("UPDATE core_keys SET used_count = ? WHERE id = ?", (used, key_id))
             if used >= key["max_servers"]:
                 conn.execute("UPDATE core_keys SET is_active = 0 WHERE id = ?", (key_id,))
-        conn.commit()
-
-def deactivate_core_key(key_id):
-    with get_db() as conn:
-        conn.execute("UPDATE core_keys SET is_active = 0 WHERE id = ?", (key_id,))
         conn.commit()
 
 def list_core_keys(active_only=True):
@@ -461,7 +461,7 @@ def get_stats():
         stats["disk"] = psutil.disk_usage('/').percent
     return stats
 
-# ==================== UTILITY FUNCTIONS ====================
+# ==================== UTILITY ====================
 
 def is_port_available(port):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -474,50 +474,145 @@ def is_port_available(port):
 def is_owner(user_id):
     return user_id == OWNER_ID
 
-# ==================== BEAUTIFUL FILE SERVER ====================
+# ==================== FILE SERVER WITH CUSTOM LOGIN PAGE ====================
 
 class FileServerHandler(SimpleHTTPRequestHandler):
-    """HTTP Server with Basic Auth and a modern HTML file manager."""
+    """HTTP Server with custom login page (index.html) and cookie session."""
 
     def __init__(self, *args, directory=None, password=None, instance_id=None, **kwargs):
         self.server_password = password
         self.instance_id = instance_id
+        self.login_page_path = LOGIN_PAGE
         super().__init__(*args, directory=directory, **kwargs)
 
-    def authenticate(self):
-        auth_header = self.headers.get('Authorization')
-        if not auth_header:
-            self.send_response(401)
-            self.send_header('WWW-Authenticate', 'Basic realm="VPS"')
-            self.end_headers()
-            return False
-        auth_type, credentials = auth_header.split()
-        if auth_type.lower() != 'basic':
-            return False
-        decoded = base64.b64decode(credentials).decode('utf-8')
-        _, password = decoded.split(':', 1)
-        return password == self.server_password
+    def parse_cookies(self):
+        cookie_header = self.headers.get('Cookie')
+        if cookie_header:
+            cookie = SimpleCookie()
+            cookie.load(cookie_header)
+            return cookie
+        return None
 
-    def send_head(self):
-        if not self.authenticate():
-            return None
-        return super().send_head()
+    def is_authenticated(self):
+        cookie = self.parse_cookies()
+        if cookie and 'vps_auth' in cookie:
+            token = cookie['vps_auth'].value
+            # Simple auth: store password hash in cookie (secure enough for this use)
+            expected = hashlib.sha256(self.server_password.encode()).hexdigest()
+            return hmac.compare_digest(token, expected)
+        return False
+
+    def send_login_page(self):
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.end_headers()
+        try:
+            with open(self.login_page_path, 'r', encoding='utf-8') as f:
+                login_html = f.read()
+            # Replace placeholder with instance port (optional)
+            login_html = login_html.replace('{{port}}', str(self.server.server_address[1]))
+            self.wfile.write(login_html.encode('utf-8'))
+        except FileNotFoundError:
+            # Fallback inline login
+            self.wfile.write(b'''
+            <!DOCTYPE html>
+            <html>
+            <head><title>Login</title></head>
+            <body>
+                <h2>VPS Login</h2>
+                <form method="post" action="/login">
+                    <label>Password:</label>
+                    <input type="password" name="password">
+                    <button type="submit">Login</button>
+                </form>
+            </body>
+            </html>
+            ''')
 
     def do_GET(self):
-        if not self.authenticate():
+        if self.path == '/logout':
+            self.send_response(303)
+            self.send_header('Location', '/')
+            self.send_header('Set-Cookie', 'vps_auth=; Path=/; Max-Age=0')
+            self.end_headers()
             return
+
+        if not self.is_authenticated():
+            self.send_login_page()
+            return
+
+        # Authenticated – serve file/directory
         path = self.translate_path(self.path)
         if os.path.isdir(path):
             self.serve_directory(path)
         else:
             super().do_GET()
 
+    def do_POST(self):
+        if self.path == '/login':
+            # Process login form
+            content_length = int(self.headers.get('Content-Length', 0))
+            post_data = self.rfile.read(content_length).decode('utf-8')
+            params = parse_qs(post_data)
+            password = params.get('password', [''])[0]
+            if password == self.server_password:
+                # Set auth cookie
+                token = hashlib.sha256(self.server_password.encode()).hexdigest()
+                self.send_response(303)
+                self.send_header('Location', '/')
+                self.send_header('Set-Cookie', f'vps_auth={token}; Path=/; HttpOnly')
+                self.end_headers()
+            else:
+                self.send_response(401)
+                self.send_header('Content-Type', 'text/html')
+                self.end_headers()
+                self.wfile.write(b'<h2>Invalid password</h2><a href="/">Try again</a>')
+            return
+
+        if not self.is_authenticated():
+            self.send_login_page()
+            return
+
+        # Handle file upload / delete (authenticated)
+        content_type = self.headers.get('Content-Type', '')
+        if 'multipart/form-data' in content_type:
+            import cgi
+            form = cgi.FieldStorage(
+                fp=self.rfile,
+                headers=self.headers,
+                environ={'REQUEST_METHOD': 'POST'}
+            )
+            file_item = form.getfirst('file')
+            if file_item and file_item.filename:
+                filename = os.path.basename(file_item.filename)
+                filepath = os.path.join(self.directory, filename)
+                with open(filepath, 'wb') as f:
+                    f.write(file_item.file.read())
+                size = os.path.getsize(filepath)
+                log_file_upload(self.instance_id, filename, filepath, size)
+                self.send_response(303)
+                self.send_header('Location', '/')
+                self.end_headers()
+                return
+            delete_file = form.getfirst('delete')
+            if delete_file:
+                filepath = os.path.join(self.directory, delete_file)
+                if os.path.exists(filepath) and os.path.isfile(filepath):
+                    os.remove(filepath)
+                    self.send_response(303)
+                    self.send_header('Location', '/')
+                    self.end_headers()
+                return
+        self.send_response(400)
+        self.end_headers()
+        self.wfile.write(b'Bad request')
+
     def serve_directory(self, path):
-        """Serve a beautiful HTML directory listing with upload form."""
+        """Serve beautiful file listing (authenticated only)."""
         try:
             list = os.listdir(path)
         except OSError:
-            self.send_error(404, "No permission to list directory")
+            self.send_error(404, "No permission")
             return
 
         list.sort(key=lambda a: a.lower())
@@ -533,9 +628,8 @@ class FileServerHandler(SimpleHTTPRequestHandler):
     <style>
         body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f5f7fa; margin: 0; padding: 20px; color: #333; }}
         .container {{ max-width: 1200px; margin: auto; background: white; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); padding: 30px; }}
-        h1 {{ margin-top: 0; color: #2c3e50; font-weight: 400; }}
+        h1 {{ margin-top: 0; color: #2c3e50; }}
         .info {{ background: #e8f4fd; padding: 15px; border-radius: 5px; margin-bottom: 20px; }}
-        .info strong {{ color: #2980b9; }}
         table {{ width: 100%; border-collapse: collapse; }}
         th {{ text-align: left; background: #34495e; color: white; padding: 12px; }}
         td {{ padding: 12px; border-bottom: 1px solid #ddd; }}
@@ -545,15 +639,15 @@ class FileServerHandler(SimpleHTTPRequestHandler):
         .btn:hover {{ opacity: 0.9; }}
         .upload-form {{ margin: 20px 0; padding: 20px; background: #ecf0f1; border-radius: 5px; }}
         input[type=file] {{ padding: 10px; }}
+        .logout {{ float: right; }}
         .footer {{ margin-top: 30px; font-size: 0.9em; color: #7f8c8d; text-align: center; }}
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>📁 VPS File Server</h1>
+        <h1>📁 VPS File Server <a href="/logout" class="btn btn-danger logout">Logout</a></h1>
         <div class="info">
             <strong>Public URL:</strong> http://{public_host}:{port}<br>
-            <strong>Password:</strong> (provided by bot)
         </div>
 
         <div class="upload-form">
@@ -572,7 +666,6 @@ class FileServerHandler(SimpleHTTPRequestHandler):
                 <th>Actions</th>
             </tr>
         """
-
         for name in list:
             fullname = os.path.join(path, name)
             displayname = linkname = name
@@ -601,7 +694,7 @@ class FileServerHandler(SimpleHTTPRequestHandler):
         html_content += """
         </table>
         <div class="footer">
-            Powered by Telegram VPS Bot – Secure & Private
+            Powered by Telegram VPS Bot – Bangladesh Edition
         </div>
     </div>
 </body>
@@ -611,51 +704,12 @@ class FileServerHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(html_content.encode('utf-8'))
 
-    def do_POST(self):
-        if not self.authenticate():
-            return
-        content_type = self.headers.get('Content-Type', '')
-        if 'multipart/form-data' in content_type:
-            import cgi
-            form = cgi.FieldStorage(
-                fp=self.rfile,
-                headers=self.headers,
-                environ={'REQUEST_METHOD': 'POST'}
-            )
-            # Handle file upload
-            file_item = form.getfirst('file')
-            if file_item and file_item.filename:
-                filename = os.path.basename(file_item.filename)
-                filepath = os.path.join(self.directory, filename)
-                with open(filepath, 'wb') as f:
-                    f.write(file_item.file.read())
-                # Log to database
-                size = os.path.getsize(filepath)
-                log_file_upload(self.instance_id, filename, filepath, size)
-                self.send_response(303)
-                self.send_header('Location', '/')
-                self.end_headers()
-                return
-            # Handle delete
-            delete_file = form.getfirst('delete')
-            if delete_file:
-                filepath = os.path.join(self.directory, delete_file)
-                if os.path.exists(filepath) and os.path.isfile(filepath):
-                    os.remove(filepath)
-                    self.send_response(303)
-                    self.send_header('Location', '/')
-                    self.end_headers()
-                    return
-        self.send_response(400)
-        self.end_headers()
-        self.wfile.write(b'Bad request')
-
     def log_message(self, format, *args):
         pass
 
 def run_file_server(port, password, directory, instance_id):
     """Run file server bound to 0.0.0.0 (public)."""
-    server_address = ('0.0.0.0', port)  # 🌍 PUBLIC ACCESS
+    server_address = ('0.0.0.0', port)
     handler = lambda *args, **kwargs: FileServerHandler(
         *args, directory=directory, password=password, instance_id=instance_id, **kwargs
     )
@@ -739,7 +793,7 @@ def expiry_checker():
             logger.error(f"Expiry checker error: {e}")
         time.sleep(60)
 
-# ==================== TELEGRAM BOT ====================
+# ==================== TELEGRAM BOT (WEBHOOK MODE) ====================
 
 bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 
@@ -821,6 +875,7 @@ def help_handler(message):
         "• **My VPS** – View and manage your active servers.\n"
         "• Each VPS is a **public file server** with password protection.\n"
         "• **Access URL**: `http://<server-ip>:<port>` (shown in bot).\n"
+        "• **Login**: Use the password on the custom login page.\n"
         "• Upload/download/delete files via beautiful web interface.\n"
         "• Servers auto‑expire after the key's duration.\n"
         "• **Renewal**: If you have an expired server, redeeming a key will ask if you want to renew it.\n\n"
@@ -1334,11 +1389,33 @@ def fallback(message):
         reply_markup=main_menu(user_id)
     )
 
-# ==================== FLASK ADMIN WEB PANEL ====================
+# ==================== FLASK WEBHOOK & ADMIN ====================
 
 app = Flask(__name__)
 app.secret_key = INSTANCE_SECRET
 
+# ---------- Telegram Webhook ----------
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    if request.headers.get('content-type') == 'application/json':
+        json_string = request.get_data().decode('utf-8')
+        update = Update.de_json(json_string)
+        bot.process_new_updates([update])
+        return '', 200
+    return '', 403
+
+def set_webhook():
+    if not PUBLIC_URL:
+        logger.error("PUBLIC_URL not set. Cannot set webhook.")
+        return False
+    webhook_url = f"{PUBLIC_URL}/webhook"
+    bot.remove_webhook()
+    time.sleep(0.5)
+    bot.set_webhook(url=webhook_url)
+    logger.info(f"Webhook set to {webhook_url}")
+    return True
+
+# ---------- Flask Admin ----------
 def verify_admin(core_key, instance_secret):
     return core_key == os.getenv("CORE_KEY", "CHANGE_ME") and instance_secret == INSTANCE_SECRET
 
@@ -1469,7 +1546,6 @@ def admin_keys():
 @admin_required
 def admin_settings():
     if request.method == 'POST':
-        # Handle port range
         min_port = request.form.get('port_min')
         max_port = request.form.get('port_max')
         public_host = request.form.get('public_host')
@@ -1510,29 +1586,29 @@ def admin_export():
 
 # ==================== MAIN ====================
 
-def run_flask():
-    logger.info(f"Starting Flask admin on http://127.0.0.1:{ADMIN_PORT}")
-    app.run(host="127.0.0.1", port=ADMIN_PORT, debug=False, use_reloader=False)
-
-def run_bot():
-    logger.info("Starting Telegram bot...")
-    try:
-        bot.infinity_polling()
-    except Exception as e:
-        logger.error(f"Bot polling error: {e}")
-
 def main():
     init_db()
-    # Auto‑detect and cache public IP on startup
+    # Auto‑detect public IP
     public_ip = detect_public_ip()
     if not get_setting("public_host"):
         set_setting("public_host", public_ip)
+
     # Start expiry checker
     threading.Thread(target=expiry_checker, daemon=True).start()
-    # Start bot thread
-    threading.Thread(target=run_bot, daemon=True).start()
-    # Run Flask in main thread
-    run_flask()
+
+    # Set webhook if PUBLIC_URL is provided
+    if PUBLIC_URL:
+        set_webhook()
+    else:
+        logger.warning("PUBLIC_URL not set. Bot will not receive updates. Set it in .env")
+
+    # Run Flask (webhook receiver + admin panel)
+    # We'll run on ADMIN_PORT, but Telegram webhook expects WEBHOOK_PORT.
+    # If they are different, you need to proxy or set PUBLIC_URL accordingly.
+    # For simplicity, we run Flask on WEBHOOK_PORT (Telegram endpoint) and admin on same port.
+    # If you need admin on separate port, adjust.
+    logger.info(f"Starting Flask on http://0.0.0.0:{WEBHOOK_PORT} (webhook & admin)")
+    app.run(host="0.0.0.0", port=WEBHOOK_PORT, debug=False, use_reloader=False)
 
 if __name__ == "__main__":
     main()
