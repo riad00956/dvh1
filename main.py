@@ -1,1831 +1,1323 @@
 #!/usr/bin/env python3
 """
-================================================================================
-        ULTIMATE TELEGRAM ADMIN BOT – AIOGRAM 3.7+ – RENDER READY
-                 NO state= IN CALLBACK QUERIES – FULLY FIXED
-================================================================================
-Hardcoded bot token & admin ID. Full inline keyboard navigation.
-SQLite database. JWT key generation. 50+ admin features.
-Built-in aiohttp health check server on $PORT.
-================================================================================
+Telegram Personal VPS Bot – Premium Edition
+- Multi‑user, multi‑server with key‑based expiry
+- Admin panel for user/instance/key management
+- Automatic server renewal & port range configuration
+- Clean menu‑based Telegram interface
 """
 
 import os
 import sys
-import sqlite3
-import uuid
 import json
-import csv
-import io
+import uuid
+import socket
 import logging
-import asyncio
-import shutil
+import threading
+import sqlite3
+import random
+import string
+import time
+import signal
+import subprocess
 from datetime import datetime, timedelta
 from functools import wraps
-from typing import Optional, Union
+from http.server import HTTPServer, SimpleHTTPRequestHandler
+from urllib.parse import parse_qs, unquote
+import base64
 
-import jwt
-import aiosqlite
-from aiohttp import web
-
-from aiogram import Bot, Dispatcher, types
-from aiogram.enums import ParseMode
-from aiogram.client.default import DefaultBotProperties
-from aiogram.filters import Command, StateFilter
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import (
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    CallbackQuery,
-    BufferedInputFile
+# Third‑party
+from dotenv import load_dotenv, set_key
+import telebot
+from telebot.types import (
+    ReplyKeyboardMarkup, KeyboardButton,
+    InlineKeyboardMarkup, InlineKeyboardButton
 )
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram import Router
+from flask import Flask, request, session, redirect, url_for, send_file, abort, render_template_string
 
-# =================================================================================
-#                                    CONFIGURATION
-# =================================================================================
-BOT_TOKEN = "8011804210:AAE--NiCSKKjbX4TC3nJVxuW64Fu53Ywh0w"
-ADMIN_IDS = [8373846582]                # Only these users can use the bot
-JWT_SECRET = "supersecretkey12345678901234567890123456789012"  # 32+ chars
-DATABASE_PATH = "admin_bot.db"
-BACKUP_DIR = "backups"
-HEALTH_CHECK_PORT = int(os.environ.get("PORT", 10000))  # Render port
+# Optional monitoring
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
 
-# =================================================================================
-#                                    LOGGING
-# =================================================================================
+# ==================== CONFIGURATION ====================
+
+ENV_FILE = ".env"
+load_dotenv(ENV_FILE)
+
+# Provided credentials (used as fallback if .env is missing)
+DEFAULT_BOT_TOKEN = "8011804210:AAE--NiCSKKjbX4TC3nJVxuW64Fu53Ywh0w"
+DEFAULT_OWNER_ID = 8373846582
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", DEFAULT_BOT_TOKEN)
+OWNER_ID = os.getenv("OWNER_ID")
+if not OWNER_ID:
+    OWNER_ID = str(DEFAULT_OWNER_ID)
+try:
+    OWNER_ID = int(OWNER_ID)
+except ValueError:
+    logging.error("OWNER_ID must be an integer")
+    sys.exit(1)
+
+# Instance identity
+INSTANCE_ID = os.getenv("INSTANCE_ID")
+if not INSTANCE_ID:
+    INSTANCE_ID = str(uuid.uuid4())[:8]
+    set_key(ENV_FILE, "INSTANCE_ID", INSTANCE_ID)
+
+INSTANCE_SECRET = os.getenv("INSTANCE_SECRET")
+if not INSTANCE_SECRET:
+    INSTANCE_SECRET = str(uuid.uuid4())
+    set_key(ENV_FILE, "INSTANCE_SECRET", INSTANCE_SECRET)
+
+# Flask admin port
+ADMIN_PORT = int(os.getenv("ADMIN_PORT", 5000))
+
+# Default port range (can be changed via admin panel)
+DEFAULT_PORT_MIN = 1999
+DEFAULT_PORT_MAX = 9999
+PORT_MIN = int(os.getenv("PORT_MIN", DEFAULT_PORT_MIN))
+PORT_MAX = int(os.getenv("PORT_MAX", DEFAULT_PORT_MAX))
+
+# Database
+DB_FILE = f"instance_{INSTANCE_ID}.db"
+
+# ==================== LOGGING ====================
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.FileHandler("admin_bot.log"),
-        logging.StreamHandler()
-    ]
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("VPSBot")
 
-os.makedirs(BACKUP_DIR, exist_ok=True)
+# ==================== DATABASE LAYER ====================
 
-# =================================================================================
-#                                    DATABASE INIT
-# =================================================================================
-async def init_db():
-    """Create all SQLite tables asynchronously."""
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS core_keys (
-                key_id TEXT PRIMARY KEY,
-                issued_to INTEGER,
-                issued_by INTEGER,
-                max_instances INTEGER,
-                expiry TIMESTAMP,
-                usage_count INTEGER DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                note TEXT,
-                is_active INTEGER DEFAULT 1,
-                last_used TIMESTAMP,
-                template_name TEXT
-            )
-        """)
-        
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS user_instances (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                key_id TEXT,
-                user_id INTEGER,
-                port INTEGER,
-                last_heartbeat TIMESTAMP,
-                is_active INTEGER DEFAULT 1,
-                ip_address TEXT,
-                version TEXT,
-                FOREIGN KEY(key_id) REFERENCES core_keys(key_id) ON DELETE CASCADE
-            )
-        """)
-        
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS admin_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                admin_id INTEGER,
-                action TEXT,
-                target TEXT,
-                details TEXT,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS blacklist (
-                user_id INTEGER PRIMARY KEY,
-                reason TEXT,
-                blocked_by INTEGER,
-                blocked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS key_templates (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT UNIQUE,
-                days INTEGER,
-                max_instances INTEGER,
-                note TEXT,
-                created_by INTEGER,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS broadcast_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                admin_id INTEGER,
-                message TEXT,
-                recipients INTEGER,
-                successful INTEGER,
-                failed INTEGER,
-                sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_keys_issued_to ON core_keys(issued_to)")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_keys_expiry ON core_keys(expiry)")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_instances_user ON user_instances(user_id)")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_logs_time ON admin_logs(timestamp)")
-        
-        await db.commit()
-    logger.info("Database initialized.")
-
-async def get_db():
-    """Return a new aiosqlite connection."""
-    conn = await aiosqlite.connect(DATABASE_PATH)
-    conn.row_factory = aiosqlite.Row
+def get_db():
+    conn = sqlite3.connect(DB_FILE, timeout=10)
+    conn.row_factory = sqlite3.Row
     return conn
 
-async def log_admin_action(admin_id: int, action: str, target: str, details: str = ""):
-    """Insert a log entry for admin actions."""
-    async with await get_db() as db:
-        await db.execute(
-            "INSERT INTO admin_logs (admin_id, action, target, details) VALUES (?, ?, ?, ?)",
-            (admin_id, action, target, details[:500])
-        )
-        await db.commit()
-
-# =================================================================================
-#                                    JWT HELPERS
-# =================================================================================
-def generate_jwt_key(user_id: int, days: int, max_instances: int, note: str = "", template: str = "") -> tuple:
-    """Generate a signed JWT Core Key."""
-    key_id = str(uuid.uuid4())
-    expiry = datetime.utcnow() + timedelta(days=days)
-    payload = {
-        "key_id": key_id,
-        "sub": user_id,
-        "exp": expiry.timestamp(),
-        "max_instances": max_instances,
-        "usage": 0,
-        "note": note[:200],
-        "template": template[:50]
-    }
-    token = jwt.encode(payload, JWT_SECRET, algorithm="HS256")
-    return token, key_id, expiry
-
-async def store_key(key_id: str, user_id: int, admin_id: int, max_instances: int, expiry: datetime, note: str, template: str = ""):
-    """Store key in database."""
-    async with await get_db() as db:
-        await db.execute("""
-            INSERT INTO core_keys
-            (key_id, issued_to, issued_by, max_instances, expiry, note, template_name)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (key_id, user_id, admin_id, max_instances, expiry.isoformat(), note[:200], template[:50]))
-        await db.commit()
-
-def decode_jwt_token(token: str) -> Optional[dict]:
-    """Decode and verify JWT. Returns payload or None."""
-    try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-        return payload
-    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
-        return None
-
-async def revoke_key(key_id: str, admin_id: int) -> bool:
-    """Revoke a key and deactivate its instances."""
-    async with await get_db() as db:
-        key = await db.execute_fetchone("SELECT * FROM core_keys WHERE key_id = ?", (key_id,))
-        if not key:
-            return False
-        await db.execute("DELETE FROM core_keys WHERE key_id = ?", (key_id,))
-        await db.execute("UPDATE user_instances SET is_active = 0 WHERE key_id = ?", (key_id,))
-        await log_admin_action(admin_id, "revoke", f"key:{key_id}", f"user:{key[1]}")
-        await db.commit()
-    return True
-
-# =================================================================================
-#                                    BOT INIT – AIOGRAM 3.7+ (FIXED)
-# =================================================================================
-bot = Bot(
-    token=BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN)
-)
-storage = MemoryStorage()
-dp = Dispatcher(storage=storage)
-router = Router()
-dp.include_router(router)
-
-# =================================================================================
-#                                    HEALTH CHECK SERVER (AIOHTTP)
-# =================================================================================
-async def health_check(request):
-    return web.Response(text="OK")
-
-async def start_health_server():
-    app = web.Application()
-    app.router.add_get("/", health_check)
-    app.router.add_get("/health", health_check)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", HEALTH_CHECK_PORT)
-    await site.start()
-    logger.info(f"Health check server running on port {HEALTH_CHECK_PORT}")
-
-# =================================================================================
-#                                    FSM STATES
-# =================================================================================
-class KeyGeneration(StatesGroup):
-    waiting_user_id = State()
-    waiting_days = State()
-    waiting_max_instances = State()
-    waiting_note = State()
-
-class KeyEdit(StatesGroup):
-    waiting_key_id = State()
-    waiting_new_max_instances = State()
-    waiting_extend_days = State()
-    waiting_new_note = State()
-
-class KeySearch(StatesGroup):
-    waiting_query = State()
-
-class BlacklistAdd(StatesGroup):
-    waiting_user_id = State()
-    waiting_reason = State()
-
-class Broadcast(StatesGroup):
-    waiting_message = State()
-    waiting_confirm = State()
-
-class TemplateCreate(StatesGroup):
-    waiting_name = State()
-    waiting_days = State()
-    waiting_max_instances = State()
-    waiting_note = State()
-
-class KeyRevoke(StatesGroup):
-    waiting_key_id = State()
-
-# =================================================================================
-#                                    ADMIN ONLY DECORATOR
-# =================================================================================
-def admin_only(func):
-    @wraps(func)
-    async def wrapper(message: types.Message, *args, **kwargs):
-        if message.from_user.id not in ADMIN_IDS:
-            await message.reply("⛔ **Unauthorized.** This bot is restricted.")
-            return
-        return await func(message, *args, **kwargs)
-    return wrapper
-
-def admin_callback(func):
-    @wraps(func)
-    async def wrapper(callback: CallbackQuery, *args, **kwargs):
-        if callback.from_user.id not in ADMIN_IDS:
-            await callback.answer("⛔ Unauthorized", show_alert=True)
-            return
-        return await func(callback, *args, **kwargs)
-    return wrapper
-
-# =================================================================================
-#                                    INLINE KEYBOARDS
-# =================================================================================
-def main_menu_keyboard() -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    builder.button(text="🔑 Generate Key", callback_data="menu_genkey")
-    builder.button(text="📋 List Keys", callback_data="menu_listkeys_0")
-    builder.button(text="🔍 Search Keys", callback_data="menu_search")
-    builder.button(text="📊 Statistics", callback_data="menu_stats")
-    builder.button(text="🖥 Active Instances", callback_data="menu_instances_0")
-    builder.button(text="🗑 Revoke Key", callback_data="menu_revoke")
-    builder.button(text="✏️ Edit Key", callback_data="menu_edit")
-    builder.button(text="📦 Key Templates", callback_data="menu_templates")
-    builder.button(text="🚫 Blacklist", callback_data="menu_blacklist")
-    builder.button(text="📢 Broadcast", callback_data="menu_broadcast")
-    builder.button(text="🧹 Cleanup", callback_data="menu_cleanup")
-    builder.button(text="💾 Backup/Restore", callback_data="menu_backup")
-    builder.button(text="📤 Export Keys", callback_data="menu_export")
-    builder.button(text="📜 Logs", callback_data="menu_logs_0")
-    builder.button(text="⚙️ Settings", callback_data="menu_settings")
-    builder.button(text="❌ Close", callback_data="menu_close")
-    builder.adjust(2)
-    return builder.as_markup()
-
-def back_to_main_keyboard() -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    builder.button(text="🔙 Main Menu", callback_data="back_main")
-    return builder.as_markup()
-
-def confirm_keyboard(action: str, key_id: str = None) -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    callback_data = f"confirm_{action}"
-    if key_id:
-        callback_data += f"_{key_id}"
-    builder.button(text="✅ Confirm", callback_data=callback_data)
-    builder.button(text="❌ Cancel", callback_data="back_main")
-    builder.adjust(2)
-    return builder.as_markup()
-
-def pagination_keyboard(base_callback: str, page: int, total_pages: int) -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    if page > 0:
-        builder.button(text="◀️ Prev", callback_data=f"{base_callback}_{page-1}")
-    builder.button(text=f"{page+1}/{total_pages}", callback_data="noop")
-    if page < total_pages - 1:
-        builder.button(text="Next ▶️", callback_data=f"{base_callback}_{page+1}")
-    builder.adjust(3)
-    builder.row(InlineKeyboardButton(text="🔙 Main Menu", callback_data="back_main"))
-    return builder.as_markup()
-
-# =================================================================================
-#                                    PAGINATION HELPERS
-# =================================================================================
-async def paginate_keys(page: int = 0, per_page: int = 10, filter_expired: bool = False, user_id: int = None):
-    """Return paginated list of keys and total pages."""
-    async with await get_db() as db:
-        query = "SELECT key_id, issued_to, max_instances, usage_count, expiry, note, created_at, is_active FROM core_keys"
-        params = []
-        conditions = []
-        if filter_expired:
-            conditions.append("expiry < datetime('now')")
-        if user_id:
-            conditions.append("issued_to = ?")
-            params.append(user_id)
-        if conditions:
-            query += " WHERE " + " AND ".join(conditions)
-        query += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
-        params.extend([per_page, page * per_page])
-        cursor = await db.execute(query, params)
-        keys = await cursor.fetchall()
-        
-        count_query = "SELECT COUNT(*) FROM core_keys"
-        if conditions:
-            count_query += " WHERE " + " AND ".join(conditions)
-        cursor = await db.execute(count_query, params[:len(params)-2] if user_id else [])
-        total = (await cursor.fetchone())[0]
-    return keys, total
-
-# =================================================================================
-#                                    COMMAND HANDLERS
-# =================================================================================
-@router.message(Command("start"))
-@admin_only
-async def cmd_start(message: types.Message):
-    await message.answer(
-        "🔐 **Ultimate Admin Control Panel**\n\n"
-        "Welcome to the Core Key Management System.\n"
-        "All functions are available via the inline keyboard below.",
-        reply_markup=main_menu_keyboard()
-    )
-    await log_admin_action(message.from_user.id, "command", "/start")
-
-@router.message(Command("cancel"))
-@admin_only
-async def cmd_cancel(message: types.Message, state: FSMContext):
-    current_state = await state.get_state()
-    if current_state is None:
-        await message.reply("No active operation.")
-        return
-    await state.clear()
-    await message.reply("❌ Operation cancelled.", reply_markup=main_menu_keyboard())
-
-# =================================================================================
-#                                    CALLBACK: MAIN MENU
-# =================================================================================
-@router.callback_query(lambda c: c.data == "back_main")
-@admin_callback
-async def back_to_main(callback: CallbackQuery, state: FSMContext = None):
-    if state:
-        await state.clear()
-    await callback.message.edit_text(
-        "🔐 **Ultimate Admin Control Panel**",
-        reply_markup=main_menu_keyboard()
-    )
-    await callback.answer()
-
-@router.callback_query(lambda c: c.data == "menu_close")
-@admin_callback
-async def close_menu(callback: CallbackQuery):
-    await callback.message.delete()
-    await callback.answer("Menu closed.")
-
-@router.callback_query(lambda c: c.data == "noop")
-@admin_callback
-async def noop(callback: CallbackQuery):
-    await callback.answer()
-
-# =================================================================================
-#                                    KEY GENERATION
-# =================================================================================
-@router.callback_query(lambda c: c.data == "menu_genkey")
-@admin_callback
-async def menu_genkey(callback: CallbackQuery, state: FSMContext):
-    async with await get_db() as db:
-        cursor = await db.execute("SELECT name FROM key_templates LIMIT 1")
-        has_templates = await cursor.fetchone() is not None
-    
-    builder = InlineKeyboardBuilder()
-    builder.button(text="➕ Manual Entry", callback_data="genkey_manual")
-    if has_templates:
-        builder.button(text="📋 Use Template", callback_data="genkey_template")
-    builder.button(text="🔙 Main Menu", callback_data="back_main")
-    builder.adjust(1)
-    
-    await callback.message.edit_text(
-        "🔑 **Generate Core Key**\n\nChoose input method:",
-        reply_markup=builder.as_markup()
-    )
-    await callback.answer()
-
-@router.callback_query(lambda c: c.data == "genkey_manual")
-@admin_callback
-async def genkey_manual(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(KeyGeneration.waiting_user_id)
-    await callback.message.edit_text(
-        "🔑 **Manual Key Generation**\n\nEnter the Telegram **User ID** of the recipient:",
-        reply_markup=back_to_main_keyboard()
-    )
-    await callback.answer()
-
-@router.callback_query(lambda c: c.data == "genkey_template")
-@admin_callback
-async def genkey_template(callback: CallbackQuery):
-    async with await get_db() as db:
-        cursor = await db.execute("SELECT id, name, days, max_instances, note FROM key_templates ORDER BY name")
-        templates = await cursor.fetchall()
-    
-    if not templates:
-        await callback.message.edit_text(
-            "❌ No templates found. Create one first in **Key Templates**.",
-            reply_markup=main_menu_keyboard()
-        )
-        await callback.answer()
-        return
-    
-    builder = InlineKeyboardBuilder()
-    for t in templates:
-        builder.button(text=f"{t['name']} ({t['days']}d, {t['max_instances']} inst)",
-                       callback_data=f"genkey_usetemplate_{t['id']}")
-    builder.button(text="🔙 Main Menu", callback_data="back_main")
-    builder.adjust(1)
-    
-    await callback.message.edit_text(
-        "📋 **Select a Template:**",
-        reply_markup=builder.as_markup()
-    )
-    await callback.answer()
-
-@router.callback_query(lambda c: c.data.startswith("genkey_usetemplate_"))
-@admin_callback
-async def genkey_use_template(callback: CallbackQuery, state: FSMContext):
-    template_id = int(callback.data.split("_")[2])
-    async with await get_db() as db:
-        cursor = await db.execute(
-            "SELECT name, days, max_instances, note FROM key_templates WHERE id = ?",
-            (template_id,)
-        )
-        template = await cursor.fetchone()
-    
-    await state.update_data(
-        days=template['days'],
-        max_instances=template['max_instances'],
-        note=template['note'],
-        template_name=template['name']
-    )
-    await state.set_state(KeyGeneration.waiting_user_id)
-    await callback.message.edit_text(
-        f"📋 **Using Template:** {template['name']}\n"
-        f"Days: {template['days']}, Max Instances: {template['max_instances']}\n\n"
-        "Enter the Telegram **User ID**:",
-        reply_markup=back_to_main_keyboard()
-    )
-    await callback.answer()
-
-@router.message(KeyGeneration.waiting_user_id)
-@admin_only
-async def process_user_id(message: types.Message, state: FSMContext):
-    try:
-        user_id = int(message.text.strip())
-    except ValueError:
-        await message.reply("❌ Invalid ID. Please enter a numeric user ID.")
-        return
-    
-    async with await get_db() as db:
-        cursor = await db.execute("SELECT reason FROM blacklist WHERE user_id = ?", (user_id,))
-        blocked = await cursor.fetchone()
-    if blocked:
-        await message.reply(
-            f"⛔ This user is **blacklisted**.\nReason: {blocked['reason']}\n\n"
-            "You must remove them from blacklist first.",
-            reply_markup=main_menu_keyboard()
-        )
-        await state.clear()
-        return
-    
-    await state.update_data(user_id=user_id)
-    data = await state.get_data()
-    if 'days' in data:
-        await state.set_state(KeyGeneration.waiting_note)
-        await message.reply(
-            "📝 Enter an optional **note** for this key (or send `-` to skip):",
-            reply_markup=back_to_main_keyboard()
-        )
-    else:
-        await state.set_state(KeyGeneration.waiting_days)
-        await message.reply(
-            "📅 Enter the number of **days** this key should be valid:",
-            reply_markup=back_to_main_keyboard()
-        )
-
-@router.message(KeyGeneration.waiting_days)
-@admin_only
-async def process_days(message: types.Message, state: FSMContext):
-    try:
-        days = int(message.text.strip())
-        if days <= 0:
-            raise ValueError
-    except ValueError:
-        await message.reply("❌ Please enter a positive integer (days).")
-        return
-    await state.update_data(days=days)
-    await state.set_state(KeyGeneration.waiting_max_instances)
-    await message.reply(
-        "🖥 Enter the **maximum number of concurrent instances** (e.g., 3):",
-        reply_markup=back_to_main_keyboard()
-    )
-
-@router.message(KeyGeneration.waiting_max_instances)
-@admin_only
-async def process_max_instances(message: types.Message, state: FSMContext):
-    try:
-        max_inst = int(message.text.strip())
-        if max_inst <= 0:
-            raise ValueError
-    except ValueError:
-        await message.reply("❌ Please enter a positive integer.")
-        return
-    await state.update_data(max_instances=max_inst)
-    await state.set_state(KeyGeneration.waiting_note)
-    await message.reply(
-        "📝 Enter an optional **note** for this key (or send `-` to skip):",
-        reply_markup=back_to_main_keyboard()
-    )
-
-@router.message(KeyGeneration.waiting_note)
-@admin_only
-async def process_note(message: types.Message, state: FSMContext):
-    note = message.text.strip()
-    if note == "-":
-        note = ""
-    
-    data = await state.get_data()
-    user_id = data['user_id']
-    days = data['days']
-    max_inst = data['max_instances']
-    template = data.get('template_name', '')
-    
-    token, key_id, expiry = generate_jwt_key(user_id, days, max_inst, note, template)
-    await store_key(key_id, user_id, message.from_user.id, max_inst, expiry, note, template)
-    
-    await log_admin_action(
-        message.from_user.id,
-        "genkey",
-        f"user:{user_id} key:{key_id}",
-        f"days:{days} max:{max_inst} note:{note[:50]}"
-    )
-    
-    text = (
-        f"✅ **Core Key Generated**\n\n"
-        f"**User ID:** `{user_id}`\n"
-        f"**Expiry:** {expiry.strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
-        f"**Max Instances:** {max_inst}\n"
-        f"**Note:** {note or '—'}\n"
-        f"**Template:** {template or '—'}\n"
-        f"**Key ID:** `{key_id}`\n\n"
-        f"**Token:**\n`{token}`"
-    )
-    
-    builder = InlineKeyboardBuilder()
-    builder.button(text="🔙 Main Menu", callback_data="back_main")
-    await state.clear()
-    await message.reply(text, reply_markup=builder.as_markup())
-
-# =================================================================================
-#                                    LIST KEYS WITH PAGINATION
-# =================================================================================
-@router.callback_query(lambda c: c.data.startswith("menu_listkeys_"))
-@admin_callback
-async def menu_listkeys(callback: CallbackQuery):
-    page = int(callback.data.split("_")[2])
-    keys, total = await paginate_keys(page, per_page=8)
-    total_pages = (total + 7) // 8 if total else 1
-    
-    if not keys:
-        await callback.message.edit_text(
-            "📋 No keys found.",
-            reply_markup=main_menu_keyboard()
-        )
-        await callback.answer()
-        return
-    
-    text = f"📋 **Core Keys** (Page {page+1}/{total_pages})\n\n"
-    for key in keys:
-        expiry = datetime.fromisoformat(key['expiry'])
-        remaining = (expiry - datetime.utcnow()).days
-        status = "✅ Active" if key['is_active'] and remaining > 0 else "❌ Expired/Revoked"
-        text += (
-            f"**ID:** `{key['key_id'][:8]}...`\n"
-            f"👤 User: `{key['issued_to']}`  Used: {key['usage_count']}/{key['max_instances']}\n"
-            f"📅 Exp: {key['expiry'][:10]} ({remaining} days left)\n"
-            f"📝 Note: {key['note'] or '—'}\n"
-            f"Status: {status}\n\n"
-        )
-    
-    kb = pagination_keyboard("menu_listkeys", page, total_pages)
-    await callback.message.edit_text(text, reply_markup=kb)
-    await callback.answer()
-
-# =================================================================================
-#                                    SEARCH KEYS
-# =================================================================================
-@router.callback_query(lambda c: c.data == "menu_search")
-@admin_callback
-async def menu_search(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(KeySearch.waiting_query)
-    await callback.message.edit_text(
-        "🔍 **Search Keys**\n\nEnter a **User ID** or **Key ID** (or part of it):",
-        reply_markup=back_to_main_keyboard()
-    )
-    await callback.answer()
-
-@router.message(KeySearch.waiting_query)
-@admin_only
-async def process_search(message: types.Message, state: FSMContext):
-    query = message.text.strip()
-    async with await get_db() as db:
-        try:
-            user_id = int(query)
-            cursor = await db.execute("""
-                SELECT key_id, issued_to, max_instances, usage_count, expiry, note, created_at
-                FROM core_keys WHERE issued_to = ?
-                ORDER BY created_at DESC LIMIT 20
-            """, (user_id,))
-        except ValueError:
-            cursor = await db.execute("""
-                SELECT key_id, issued_to, max_instances, usage_count, expiry, note, created_at
-                FROM core_keys WHERE key_id LIKE ?
-                ORDER BY created_at DESC LIMIT 20
-            """, (f"%{query}%",))
-        keys = await cursor.fetchall()
-    
-    if not keys:
-        await message.reply("❌ No matching keys found.", reply_markup=main_menu_keyboard())
-        await state.clear()
-        return
-    
-    text = f"🔍 **Search Results** for `{query}`:\n\n"
-    for key in keys[:10]:
-        text += (
-            f"**ID:** `{key['key_id'][:8]}...`\n"
-            f"👤 User: `{key['issued_to']}`\n"
-            f"🔄 Used: {key['usage_count']}/{key['max_instances']}\n"
-            f"📅 Exp: {key['expiry'][:10]}\n\n"
-        )
-    if len(keys) > 10:
-        text += f"... and {len(keys)-10} more.\n"
-    
-    await state.clear()
-    await message.reply(text, reply_markup=main_menu_keyboard())
-
-# =================================================================================
-#                                    STATISTICS
-# =================================================================================
-@router.callback_query(lambda c: c.data == "menu_stats")
-@admin_callback
-async def menu_stats(callback: CallbackQuery):
-    async with await get_db() as db:
-        total_keys = (await db.execute_fetchone("SELECT COUNT(*) FROM core_keys"))[0]
-        expired_keys = (await db.execute_fetchone("SELECT COUNT(*) FROM core_keys WHERE expiry < datetime('now')"))[0]
-        active_keys = (await db.execute_fetchone("SELECT COUNT(*) FROM core_keys WHERE is_active = 1 AND expiry > datetime('now')"))[0]
-        active_instances = (await db.execute_fetchone("SELECT COUNT(*) FROM user_instances WHERE is_active = 1"))[0]
-        total_instances = (await db.execute_fetchone("SELECT COUNT(*) FROM user_instances"))[0]
-        total_usage = (await db.execute_fetchone("SELECT SUM(usage_count) FROM core_keys"))[0] or 0
-        unique_users = (await db.execute_fetchone("SELECT COUNT(DISTINCT issued_to) FROM core_keys"))[0]
-        expiring_soon = (await db.execute_fetchone("""
-            SELECT COUNT(*) FROM core_keys 
-            WHERE expiry < datetime('now', '+7 days') AND expiry > datetime('now')
-        """))[0]
-    
-    text = (
-        "📊 **Admin Statistics**\n\n"
-        f"🔑 **Total Keys Issued:** `{total_keys}`\n"
-        f"✅ **Active Keys:** `{active_keys}`\n"
-        f"⚠️ **Expired Keys:** `{expired_keys}`\n"
-        f"⏳ **Expiring in 7 days:** `{expiring_soon}`\n"
-        f"🖥 **Active Instances:** `{active_instances}`\n"
-        f"📦 **Total Instances:** `{total_instances}`\n"
-        f"🗳 **Total Key Usage:** `{total_usage}`\n"
-        f"👥 **Unique Users:** `{unique_users}`\n"
-    )
-    
-    await callback.message.edit_text(text, reply_markup=main_menu_keyboard())
-    await callback.answer()
-
-# =================================================================================
-#                                    ACTIVE INSTANCES
-# =================================================================================
-@router.callback_query(lambda c: c.data.startswith("menu_instances_"))
-@admin_callback
-async def menu_instances(callback: CallbackQuery):
-    page = int(callback.data.split("_")[2])
-    per_page = 8
-    
-    async with await get_db() as db:
-        cursor = await db.execute("""
-            SELECT i.user_id, i.port, i.last_heartbeat, i.ip_address, i.version,
-                   k.key_id, k.issued_to, k.expiry
-            FROM user_instances i
-            JOIN core_keys k ON i.key_id = k.key_id
-            WHERE i.is_active = 1
-            ORDER BY i.last_heartbeat DESC
-            LIMIT ? OFFSET ?
-        """, (per_page, page * per_page))
-        rows = await cursor.fetchall()
-        
-        total = (await db.execute_fetchone("SELECT COUNT(*) FROM user_instances WHERE is_active = 1"))[0]
-    
-    total_pages = (total + per_page - 1) // per_page if total else 1
-    
-    if not rows:
-        await callback.message.edit_text(
-            "🖥 No active instances.",
-            reply_markup=main_menu_keyboard()
-        )
-        await callback.answer()
-        return
-    
-    text = f"🖥 **Active Instances** (Page {page+1}/{total_pages})\n\n"
-    for row in rows:
-        last_seen = datetime.fromisoformat(row['last_heartbeat']) if row['last_heartbeat'] else None
-        time_ago = (datetime.utcnow() - last_seen).seconds // 60 if last_seen else "?"
-        text += (
-            f"👤 **User:** `{row['user_id']}` (issued to: {row['issued_to']})\n"
-            f"🔌 Port: `{row['port']}`  IP: {row['ip_address'] or 'N/A'}\n"
-            f"⏱ Last seen: {time_ago} min ago\n"
-            f"🆔 Key: `{row['key_id'][:8]}...` (exp: {row['expiry'][:10]})\n"
-            f"🛠 Version: {row['version'] or 'N/A'}\n\n"
-        )
-    
-    kb = pagination_keyboard("menu_instances", page, total_pages)
-    await callback.message.edit_text(text, reply_markup=kb)
-    await callback.answer()
-
-# =================================================================================
-#                                    REVOKE KEY
-# =================================================================================
-@router.callback_query(lambda c: c.data == "menu_revoke")
-@admin_callback
-async def menu_revoke(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(KeyRevoke.waiting_key_id)
-    await callback.message.edit_text(
-        "🗑 **Revoke Core Key**\n\n"
-        "Send the **Key ID** or the full **JWT token**.",
-        reply_markup=back_to_main_keyboard()
-    )
-    await callback.answer()
-
-@router.message(KeyRevoke.waiting_key_id)
-@admin_only
-async def process_revoke(message: types.Message, state: FSMContext):
-    key_input = message.text.strip()
-    key_id = None
-    
-    if key_input.count('.') == 2:
-        payload = decode_jwt_token(key_input)
-        if payload:
-            key_id = payload.get('key_id')
-        else:
-            await message.reply("❌ Invalid or expired token.")
-            return
-    else:
-        key_id = key_input
-    
-    async with await get_db() as db:
-        key = await db.execute_fetchone("SELECT * FROM core_keys WHERE key_id = ?", (key_id,))
-    
-    if not key:
-        await message.reply("❌ Key not found.")
-        await state.clear()
-        return
-    
-    await state.update_data(key_id=key_id)
-    await message.reply(
-        f"⚠️ **Are you sure?**\n\n"
-        f"This will revoke key `{key_id[:8]}...` for user `{key[1]}`.\n"
-        f"All active instances will be deactivated.",
-        reply_markup=confirm_keyboard("revoke", key_id)
-    )
-    await state.clear()
-
-@router.callback_query(lambda c: c.data.startswith("confirm_revoke_"))
-@admin_callback
-async def confirm_revoke(callback: CallbackQuery):
-    key_id = callback.data.split("_")[2]
-    success = await revoke_key(key_id, callback.from_user.id)
-    if success:
-        await callback.message.edit_text(
-            f"✅ Key `{key_id[:8]}...` revoked and instances deactivated.",
-            reply_markup=main_menu_keyboard()
-        )
-    else:
-        await callback.message.edit_text("❌ Key not found.", reply_markup=main_menu_keyboard())
-    await callback.answer()
-
-# =================================================================================
-#                                    KEY EDIT – FIXED: NO state= IN DECORATOR
-# =================================================================================
-@router.callback_query(lambda c: c.data == "menu_edit")
-@admin_callback
-async def menu_edit(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(KeyEdit.waiting_key_id)
-    await callback.message.edit_text(
-        "✏️ **Edit Core Key**\n\nSend the **Key ID** or full **JWT token**.",
-        reply_markup=back_to_main_keyboard()
-    )
-    await callback.answer()
-
-@router.message(KeyEdit.waiting_key_id)
-@admin_only
-async def edit_key_fetch(message: types.Message, state: FSMContext):
-    key_input = message.text.strip()
-    key_id = None
-    
-    if key_input.count('.') == 2:
-        payload = decode_jwt_token(key_input)
-        if payload:
-            key_id = payload.get('key_id')
-        else:
-            await message.reply("❌ Invalid or expired token.")
-            return
-    else:
-        key_id = key_input
-    
-    async with await get_db() as db:
-        key = await db.execute_fetchone("SELECT * FROM core_keys WHERE key_id = ?", (key_id,))
-    
-    if not key:
-        await message.reply("❌ Key not found.")
-        await state.clear()
-        return
-    
-    await state.update_data(key_id=key_id)
-    
-    builder = InlineKeyboardBuilder()
-    builder.button(text="🖥 Change Max Instances", callback_data="edit_maxinst")
-    builder.button(text="📅 Extend Expiry", callback_data="edit_extend")
-    builder.button(text="📝 Edit Note", callback_data="edit_note")
-    builder.button(text="🔙 Cancel", callback_data="back_main")
-    builder.adjust(2)
-    
-    await message.reply(
-        f"✏️ **Editing Key** `{key_id[:8]}...`\n"
-        f"Current: Max Instances={key['max_instances']}, Expires={key['expiry'][:10]}, Note={key['note'] or '—'}\n\n"
-        "What would you like to change?",
-        reply_markup=builder.as_markup()
-    )
-    await state.set_state(KeyEdit.waiting_new_max_instances)
-
-# 🔧 FIXED: Removed state= from decorator, added explicit state check
-@router.callback_query(lambda c: c.data == "edit_maxinst")
-@admin_callback
-async def edit_maxinst_prompt(callback: CallbackQuery, state: FSMContext):
-    current_state = await state.get_state()
-    if current_state != KeyEdit.waiting_new_max_instances.state:
-        await callback.answer("This action is not available now.", show_alert=True)
-        return
-    await state.set_state(KeyEdit.waiting_new_max_instances)
-    await callback.message.edit_text(
-        "🖥 Enter the **new maximum number of instances**:",
-        reply_markup=back_to_main_keyboard()
-    )
-    await callback.answer()
-
-@router.message(KeyEdit.waiting_new_max_instances)
-@admin_only
-async def edit_maxinst_save(message: types.Message, state: FSMContext):
-    try:
-        new_max = int(message.text.strip())
-        if new_max <= 0:
-            raise ValueError
-    except ValueError:
-        await message.reply("❌ Please enter a positive integer.")
-        return
-    
-    data = await state.get_data()
-    key_id = data['key_id']
-    
-    async with await get_db() as db:
-        await db.execute("UPDATE core_keys SET max_instances = ? WHERE key_id = ?", (new_max, key_id))
-        await db.commit()
-    
-    await log_admin_action(message.from_user.id, "edit_key", f"key:{key_id}", f"max_instances={new_max}")
-    await state.clear()
-    await message.reply(f"✅ Max instances updated to {new_max}.", reply_markup=main_menu_keyboard())
-
-# 🔧 FIXED: Removed state= from decorator
-@router.callback_query(lambda c: c.data == "edit_extend")
-@admin_callback
-async def edit_extend_prompt(callback: CallbackQuery, state: FSMContext):
-    current_state = await state.get_state()
-    if current_state != KeyEdit.waiting_new_max_instances.state:
-        await callback.answer("This action is not available now.", show_alert=True)
-        return
-    await state.set_state(KeyEdit.waiting_extend_days)
-    await callback.message.edit_text(
-        "📅 Enter the **number of days to extend** the key:",
-        reply_markup=back_to_main_keyboard()
-    )
-    await callback.answer()
-
-@router.message(KeyEdit.waiting_extend_days)
-@admin_only
-async def edit_extend_save(message: types.Message, state: FSMContext):
-    try:
-        days = int(message.text.strip())
-        if days <= 0:
-            raise ValueError
-    except ValueError:
-        await message.reply("❌ Please enter a positive integer.")
-        return
-    
-    data = await state.get_data()
-    key_id = data['key_id']
-    
-    async with await get_db() as db:
-        row = await db.execute_fetchone("SELECT expiry FROM core_keys WHERE key_id = ?", (key_id,))
-        if not row:
-            await message.reply("❌ Key not found.")
-            await state.clear()
-            return
-        current_expiry = datetime.fromisoformat(row[0])
-        new_expiry = current_expiry + timedelta(days=days)
-        await db.execute("UPDATE core_keys SET expiry = ? WHERE key_id = ?", (new_expiry.isoformat(), key_id))
-        await db.commit()
-    
-    await log_admin_action(message.from_user.id, "extend_key", f"key:{key_id}", f"+{days} days")
-    await state.clear()
-    await message.reply(f"✅ Key extended until {new_expiry.strftime('%Y-%m-%d')}.", reply_markup=main_menu_keyboard())
-
-# 🔧 FIXED: Removed state= from decorator
-@router.callback_query(lambda c: c.data == "edit_note")
-@admin_callback
-async def edit_note_prompt(callback: CallbackQuery, state: FSMContext):
-    current_state = await state.get_state()
-    if current_state != KeyEdit.waiting_new_max_instances.state:
-        await callback.answer("This action is not available now.", show_alert=True)
-        return
-    await state.set_state(KeyEdit.waiting_new_note)
-    await callback.message.edit_text(
-        "📝 Enter the **new note** for this key (or `-` to clear):",
-        reply_markup=back_to_main_keyboard()
-    )
-    await callback.answer()
-
-@router.message(KeyEdit.waiting_new_note)
-@admin_only
-async def edit_note_save(message: types.Message, state: FSMContext):
-    new_note = message.text.strip()
-    if new_note == "-":
-        new_note = ""
-    
-    data = await state.get_data()
-    key_id = data['key_id']
-    
-    async with await get_db() as db:
-        await db.execute("UPDATE core_keys SET note = ? WHERE key_id = ?", (new_note[:200], key_id))
-        await db.commit()
-    
-    await log_admin_action(message.from_user.id, "edit_key", f"key:{key_id}", f"note updated")
-    await state.clear()
-    await message.reply(f"✅ Note updated.", reply_markup=main_menu_keyboard())
-
-# =================================================================================
-#                                    KEY TEMPLATES
-# =================================================================================
-@router.callback_query(lambda c: c.data == "menu_templates")
-@admin_callback
-async def menu_templates(callback: CallbackQuery):
-    async with await get_db() as db:
-        cursor = await db.execute("SELECT id, name, days, max_instances, note, created_at FROM key_templates ORDER BY name")
-        templates = await cursor.fetchall()
-    
-    builder = InlineKeyboardBuilder()
-    builder.button(text="➕ Create Template", callback_data="template_create")
-    if templates:
-        builder.button(text="🗑 Delete Template", callback_data="template_delete")
-    builder.button(text="🔙 Main Menu", callback_data="back_main")
-    builder.adjust(2)
-    
-    text = "📦 **Key Templates**\n\n"
-    if templates:
-        for t in templates:
-            text += f"• **{t['name']}** – {t['days']}d, {t['max_instances']} inst\n"
-            if t['note']:
-                text += f"  Note: {t['note']}\n"
-    else:
-        text += "No templates yet. Create one!"
-    
-    await callback.message.edit_text(text, reply_markup=builder.as_markup())
-    await callback.answer()
-
-@router.callback_query(lambda c: c.data == "template_create")
-@admin_callback
-async def template_create_start(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(TemplateCreate.waiting_name)
-    await callback.message.edit_text(
-        "📝 **Create Key Template**\n\nEnter a **name** for this template (e.g., 'Basic', 'Premium'):",
-        reply_markup=back_to_main_keyboard()
-    )
-    await callback.answer()
-
-@router.message(TemplateCreate.waiting_name)
-@admin_only
-async def template_create_name(message: types.Message, state: FSMContext):
-    name = message.text.strip()
-    if not name:
-        await message.reply("❌ Name cannot be empty.")
-        return
-    
-    async with await get_db() as db:
-        existing = await db.execute_fetchone("SELECT name FROM key_templates WHERE name = ?", (name,))
-        if existing:
-            await message.reply("❌ A template with that name already exists. Choose another name.")
-            return
-    
-    await state.update_data(name=name)
-    await state.set_state(TemplateCreate.waiting_days)
-    await message.reply(
-        "📅 Enter the **number of days** this key should be valid:",
-        reply_markup=back_to_main_keyboard()
-    )
-
-@router.message(TemplateCreate.waiting_days)
-@admin_only
-async def template_create_days(message: types.Message, state: FSMContext):
-    try:
-        days = int(message.text.strip())
-        if days <= 0:
-            raise ValueError
-    except ValueError:
-        await message.reply("❌ Please enter a positive integer.")
-        return
-    await state.update_data(days=days)
-    await state.set_state(TemplateCreate.waiting_max_instances)
-    await message.reply(
-        "🖥 Enter the **maximum number of instances**:",
-        reply_markup=back_to_main_keyboard()
-    )
-
-@router.message(TemplateCreate.waiting_max_instances)
-@admin_only
-async def template_create_maxinst(message: types.Message, state: FSMContext):
-    try:
-        max_inst = int(message.text.strip())
-        if max_inst <= 0:
-            raise ValueError
-    except ValueError:
-        await message.reply("❌ Please enter a positive integer.")
-        return
-    await state.update_data(max_instances=max_inst)
-    await state.set_state(TemplateCreate.waiting_note)
-    await message.reply(
-        "📝 Enter an optional **note** for this template (or `-` to skip):",
-        reply_markup=back_to_main_keyboard()
-    )
-
-@router.message(TemplateCreate.waiting_note)
-@admin_only
-async def template_create_note(message: types.Message, state: FSMContext):
-    note = message.text.strip()
-    if note == "-":
-        note = ""
-    
-    data = await state.get_data()
-    name = data['name']
-    days = data['days']
-    max_inst = data['max_instances']
-    
-    async with await get_db() as db:
-        await db.execute(
-            "INSERT INTO key_templates (name, days, max_instances, note, created_by) VALUES (?, ?, ?, ?, ?)",
-            (name, days, max_inst, note[:200], message.from_user.id)
-        )
-        await db.commit()
-    
-    await log_admin_action(message.from_user.id, "create_template", f"template:{name}")
-    await state.clear()
-    await message.reply(f"✅ Template '{name}' created.", reply_markup=main_menu_keyboard())
-
-@router.callback_query(lambda c: c.data == "template_delete")
-@admin_callback
-async def template_delete_menu(callback: CallbackQuery):
-    async with await get_db() as db:
-        cursor = await db.execute("SELECT id, name FROM key_templates ORDER BY name")
-        templates = await cursor.fetchall()
-    
-    if not templates:
-        await callback.answer("No templates to delete.", show_alert=True)
-        return
-    
-    builder = InlineKeyboardBuilder()
-    for t in templates:
-        builder.button(text=f"❌ {t['name']}", callback_data=f"template_del_{t['id']}")
-    builder.button(text="🔙 Back", callback_data="menu_templates")
-    builder.adjust(1)
-    
-    await callback.message.edit_text(
-        "🗑 **Delete Template**\n\nSelect a template to delete:",
-        reply_markup=builder.as_markup()
-    )
-    await callback.answer()
-
-@router.callback_query(lambda c: c.data.startswith("template_del_"))
-@admin_callback
-async def template_delete_execute(callback: CallbackQuery):
-    template_id = int(callback.data.split("_")[2])
-    async with await get_db() as db:
-        name_row = await db.execute_fetchone("SELECT name FROM key_templates WHERE id = ?", (template_id,))
-        if name_row:
-            await db.execute("DELETE FROM key_templates WHERE id = ?", (template_id,))
-            await db.commit()
-            await log_admin_action(callback.from_user.id, "delete_template", f"template:{name_row[0]}")
-            await callback.answer(f"Template '{name_row[0]}' deleted.", show_alert=True)
-        else:
-            await callback.answer("Template not found.", show_alert=True)
-    await menu_templates(callback)
-
-# =================================================================================
-#                                    BLACKLIST
-# =================================================================================
-@router.callback_query(lambda c: c.data == "menu_blacklist")
-@admin_callback
-async def menu_blacklist(callback: CallbackQuery):
-    async with await get_db() as db:
-        cursor = await db.execute("SELECT user_id, reason, blocked_at FROM blacklist ORDER BY blocked_at DESC LIMIT 15")
-        blocked = await cursor.fetchall()
-    
-    builder = InlineKeyboardBuilder()
-    builder.button(text="➕ Add to Blacklist", callback_data="blacklist_add")
-    if blocked:
-        builder.button(text="➖ Remove from Blacklist", callback_data="blacklist_remove")
-    builder.button(text="🔙 Main Menu", callback_data="back_main")
-    builder.adjust(2)
-    
-    text = "🚫 **Blacklist**\n\n"
-    if blocked:
-        for b in blocked:
-            text += f"• User `{b['user_id']}` – {b['reason'] or 'No reason'} ({b['blocked_at'][:10]})\n"
-    else:
-        text += "No users blacklisted."
-    
-    await callback.message.edit_text(text, reply_markup=builder.as_markup())
-    await callback.answer()
-
-@router.callback_query(lambda c: c.data == "blacklist_add")
-@admin_callback
-async def blacklist_add_prompt(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(BlacklistAdd.waiting_user_id)
-    await callback.message.edit_text(
-        "🚫 **Add to Blacklist**\n\nEnter the **User ID** to block:",
-        reply_markup=back_to_main_keyboard()
-    )
-    await callback.answer()
-
-@router.message(BlacklistAdd.waiting_user_id)
-@admin_only
-async def blacklist_add_user(message: types.Message, state: FSMContext):
-    try:
-        user_id = int(message.text.strip())
-    except ValueError:
-        await message.reply("❌ Invalid User ID.")
-        return
-    
-    await state.update_data(user_id=user_id)
-    await state.set_state(BlacklistAdd.waiting_reason)
-    await message.reply(
-        "📝 Enter the **reason** for blacklisting (or send `-` to skip):",
-        reply_markup=back_to_main_keyboard()
-    )
-
-@router.message(BlacklistAdd.waiting_reason)
-@admin_only
-async def blacklist_add_reason(message: types.Message, state: FSMContext):
-    reason = message.text.strip()
-    if reason == "-":
-        reason = ""
-    
-    data = await state.get_data()
-    user_id = data['user_id']
-    
-    async with await get_db() as db:
-        await db.execute(
-            "INSERT OR REPLACE INTO blacklist (user_id, reason, blocked_by) VALUES (?, ?, ?)",
-            (user_id, reason[:200], message.from_user.id)
-        )
-        await db.commit()
-    
-    await log_admin_action(message.from_user.id, "blacklist_add", f"user:{user_id}", reason[:100])
-    await state.clear()
-    await message.reply(f"✅ User `{user_id}` added to blacklist.", reply_markup=main_menu_keyboard())
-
-@router.callback_query(lambda c: c.data == "blacklist_remove")
-@admin_callback
-async def blacklist_remove_prompt(callback: CallbackQuery):
-    async with await get_db() as db:
-        cursor = await db.execute("SELECT user_id FROM blacklist")
-        users = await cursor.fetchall()
-    
-    if not users:
-        await callback.answer("Blacklist is empty.", show_alert=True)
-        return
-    
-    builder = InlineKeyboardBuilder()
-    for u in users:
-        builder.button(text=f"❌ {u['user_id']}", callback_data=f"blacklist_remove_{u['user_id']}")
-    builder.button(text="🔙 Back", callback_data="menu_blacklist")
-    builder.adjust(1)
-    
-    await callback.message.edit_text(
-        "➖ **Remove from Blacklist**\n\nSelect a user to unblock:",
-        reply_markup=builder.as_markup()
-    )
-    await callback.answer()
-
-@router.callback_query(lambda c: c.data.startswith("blacklist_remove_"))
-@admin_callback
-async def blacklist_remove_execute(callback: CallbackQuery):
-    user_id = int(callback.data.split("_")[2])
-    async with await get_db() as db:
-        await db.execute("DELETE FROM blacklist WHERE user_id = ?", (user_id,))
-        await db.commit()
-    
-    await log_admin_action(callback.from_user.id, "blacklist_remove", f"user:{user_id}")
-    await callback.answer(f"User {user_id} removed from blacklist.", show_alert=True)
-    await menu_blacklist(callback)
-
-# =================================================================================
-#                                    BROADCAST – FIXED: NO state= IN DECORATOR
-# =================================================================================
-@router.callback_query(lambda c: c.data == "menu_broadcast")
-@admin_callback
-async def menu_broadcast(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(Broadcast.waiting_message)
-    await callback.message.edit_text(
-        "📢 **Broadcast Message**\n\n"
-        "Send the message you want to broadcast to **all users with active keys**.\n"
-        "You can use Markdown formatting.\n\n"
-        "To cancel, send /cancel.",
-        reply_markup=back_to_main_keyboard()
-    )
-    await callback.answer()
-
-@router.message(Broadcast.waiting_message)
-@admin_only
-async def broadcast_preview(message: types.Message, state: FSMContext):
-    msg_text = message.text
-    await state.update_data(message=msg_text)
-    
-    async with await get_db() as db:
-        cursor = await db.execute(
-            "SELECT DISTINCT issued_to FROM core_keys WHERE is_active = 1 AND expiry > datetime('now')"
-        )
-        recipients = [row[0] for row in await cursor.fetchall()]
-    
-    await state.update_data(recipients=recipients)
-    
-    builder = InlineKeyboardBuilder()
-    builder.button(text="✅ Send Now", callback_data="broadcast_send")
-    builder.button(text="✏️ Edit Message", callback_data="broadcast_edit")
-    builder.button(text="❌ Cancel", callback_data="back_main")
-    builder.adjust(2)
-    
-    await message.reply(
-        f"📢 **Broadcast Preview**\n\n"
-        f"Recipients: {len(recipients)} users\n\n"
-        f"Message:\n{msg_text}\n\n"
-        f"Send?",
-        reply_markup=builder.as_markup()
-    )
-    await state.set_state(Broadcast.waiting_confirm)
-
-# 🔧 FIXED: Removed state= from decorator
-@router.callback_query(lambda c: c.data == "broadcast_send")
-@admin_callback
-async def broadcast_send(callback: CallbackQuery, state: FSMContext):
-    current_state = await state.get_state()
-    if current_state != Broadcast.waiting_confirm.state:
-        await callback.answer("This action is not available now.", show_alert=True)
-        return
-    data = await state.get_data()
-    msg_text = data['message']
-    recipients = data['recipients']
-    
-    sent = 0
-    failed = 0
-    for user_id in recipients:
-        try:
-            await bot.send_message(user_id, f"📢 **Admin Broadcast**\n\n{msg_text}")
-            sent += 1
-        except Exception:
-            failed += 1
-    
-    async with await get_db() as db:
-        await db.execute(
-            "INSERT INTO broadcast_history (admin_id, message, recipients, successful, failed) VALUES (?, ?, ?, ?, ?)",
-            (callback.from_user.id, msg_text[:200], len(recipients), sent, failed)
-        )
-        await db.commit()
-    
-    await log_admin_action(callback.from_user.id, "broadcast", f"recipients:{len(recipients)}", f"sent:{sent} failed:{failed}")
-    await state.clear()
-    await callback.message.edit_text(
-        f"✅ **Broadcast sent**\n\n📨 Delivered: {sent}\n❌ Failed: {failed}",
-        reply_markup=main_menu_keyboard()
-    )
-    await callback.answer()
-
-# 🔧 FIXED: Removed state= from decorator
-@router.callback_query(lambda c: c.data == "broadcast_edit")
-@admin_callback
-async def broadcast_edit(callback: CallbackQuery, state: FSMContext):
-    current_state = await state.get_state()
-    if current_state != Broadcast.waiting_confirm.state:
-        await callback.answer("This action is not available now.", show_alert=True)
-        return
-    await state.set_state(Broadcast.waiting_message)
-    await callback.message.edit_text(
-        "📢 **Edit Broadcast Message**\n\nSend the new message:",
-        reply_markup=back_to_main_keyboard()
-    )
-    await callback.answer()
-
-# =================================================================================
-#                                    CLEANUP
-# =================================================================================
-@router.callback_query(lambda c: c.data == "menu_cleanup")
-@admin_callback
-async def menu_cleanup(callback: CallbackQuery):
-    builder = InlineKeyboardBuilder()
-    builder.button(text="🗑 Delete Expired Keys", callback_data="cleanup_expired")
-    builder.button(text="💤 Deactivate Stale Instances", callback_data="cleanup_stale")
-    builder.button(text="🧹 Full Cleanup", callback_data="cleanup_full")
-    builder.button(text="🔙 Main Menu", callback_data="back_main")
-    builder.adjust(2)
-    
-    await callback.message.edit_text(
-        "🧹 **Cleanup Tools**\n\nChoose an action:",
-        reply_markup=builder.as_markup()
-    )
-    await callback.answer()
-
-@router.callback_query(lambda c: c.data == "cleanup_expired")
-@admin_callback
-async def cleanup_expired(callback: CallbackQuery):
-    async with await get_db() as db:
-        await db.execute("DELETE FROM core_keys WHERE expiry < datetime('now')")
-        deleted = db.total_changes
-        await db.commit()
-        await log_admin_action(callback.from_user.id, "cleanup", "expired_keys", f"deleted:{deleted}")
-    
-    await callback.answer(f"✅ {deleted} expired keys deleted.", show_alert=True)
-    await menu_cleanup(callback)
-
-@router.callback_query(lambda c: c.data == "cleanup_stale")
-@admin_callback
-async def cleanup_stale(callback: CallbackQuery):
-    async with await get_db() as db:
-        await db.execute("""
-            UPDATE user_instances SET is_active = 0
-            WHERE last_heartbeat < datetime('now', '-10 minutes')
-        """)
-        deactivated = db.total_changes
-        await db.commit()
-        await log_admin_action(callback.from_user.id, "cleanup", "stale_instances", f"deactivated:{deactivated}")
-    
-    await callback.answer(f"✅ {deactivated} stale instances deactivated.", show_alert=True)
-    await menu_cleanup(callback)
-
-@router.callback_query(lambda c: c.data == "cleanup_full")
-@admin_callback
-async def cleanup_full(callback: CallbackQuery):
-    async with await get_db() as db:
-        await db.execute("DELETE FROM core_keys WHERE expiry < datetime('now')")
-        deleted_keys = db.total_changes
-        await db.execute("""
-            UPDATE user_instances SET is_active = 0
-            WHERE last_heartbeat < datetime('now', '-10 minutes')
-        """)
-        deactivated = db.total_changes
-        await db.commit()
-        await log_admin_action(callback.from_user.id, "cleanup", "full", f"keys:{deleted_keys} instances:{deactivated}")
-    
-    await callback.answer(f"✅ Full cleanup: {deleted_keys} keys, {deactivated} instances.", show_alert=True)
-    await menu_cleanup(callback)
-
-# =================================================================================
-#                                    BACKUP & RESTORE
-# =================================================================================
-@router.callback_query(lambda c: c.data == "menu_backup")
-@admin_callback
-async def menu_backup(callback: CallbackQuery):
-    builder = InlineKeyboardBuilder()
-    builder.button(text="💾 Create Backup", callback_data="backup_create")
-    builder.button(text="📂 List Backups", callback_data="backup_list")
-    builder.button(text="🔄 Restore", callback_data="backup_restore")
-    builder.button(text="🔙 Main Menu", callback_data="back_main")
-    builder.adjust(2)
-    
-    await callback.message.edit_text(
-        "💾 **Backup & Restore**\n\nManage database backups.",
-        reply_markup=builder.as_markup()
-    )
-    await callback.answer()
-
-@router.callback_query(lambda c: c.data == "backup_create")
-@admin_callback
-async def backup_create(callback: CallbackQuery):
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_file = os.path.join(BACKUP_DIR, f"backup_{timestamp}.db")
-    
-    shutil.copy2(DATABASE_PATH, backup_file)
-    
-    metadata = {
-        "timestamp": timestamp,
-        "created_by": callback.from_user.id,
-        "database": DATABASE_PATH,
-    }
-    with open(backup_file + ".meta.json", 'w') as f:
-        json.dump(metadata, f, indent=2)
-    
-    await log_admin_action(callback.from_user.id, "backup", f"file:{backup_file}")
-    
-    with open(backup_file, 'rb') as f:
-        await callback.message.reply_document(
-            BufferedInputFile(f.read(), filename=f"backup_{timestamp}.db"),
-            caption=f"✅ Backup created: `{backup_file}`"
-        )
-    await callback.answer("Backup file sent.", show_alert=True)
-
-@router.callback_query(lambda c: c.data == "backup_list")
-@admin_callback
-async def backup_list(callback: CallbackQuery):
-    backups = sorted(os.listdir(BACKUP_DIR), reverse=True)
-    db_backups = [f for f in backups if f.endswith('.db')][:20]
-    
-    if not db_backups:
-        await callback.message.edit_text("No backups found.", reply_markup=main_menu_keyboard())
-        await callback.answer()
-        return
-    
-    text = "📂 **Available Backups**\n\n"
-    for b in db_backups[:10]:
-        size = os.path.getsize(os.path.join(BACKUP_DIR, b))
-        text += f"• `{b}` ({size} bytes)\n"
-    
-    builder = InlineKeyboardBuilder()
-    for b in db_backups[:5]:
-        builder.button(text=f"📥 {b[:20]}", callback_data=f"backup_download_{b}")
-    builder.button(text="🔙 Back", callback_data="menu_backup")
-    builder.adjust(1)
-    
-    await callback.message.edit_text(text, reply_markup=builder.as_markup())
-    await callback.answer()
-
-@router.callback_query(lambda c: c.data.startswith("backup_download_"))
-@admin_callback
-async def backup_download(callback: CallbackQuery):
-    filename = callback.data[16:]
-    filepath = os.path.join(BACKUP_DIR, filename)
-    if not os.path.exists(filepath):
-        await callback.answer("File not found.", show_alert=True)
-        return
-    
-    with open(filepath, 'rb') as f:
-        await callback.message.reply_document(
-            BufferedInputFile(f.read(), filename=filename),
-            caption=f"📥 Backup: {filename}"
-        )
-    await callback.answer()
-
-@router.callback_query(lambda c: c.data == "backup_restore")
-@admin_callback
-async def backup_restore_prompt(callback: CallbackQuery):
-    backups = sorted(os.listdir(BACKUP_DIR), reverse=True)
-    db_backups = [f for f in backups if f.endswith('.db')][:10]
-    
-    if not db_backups:
-        await callback.message.edit_text("No backups to restore.", reply_markup=main_menu_keyboard())
-        await callback.answer()
-        return
-    
-    builder = InlineKeyboardBuilder()
-    for b in db_backups:
-        builder.button(text=f"⚠️ Restore {b[:20]}", callback_data=f"backup_restore_confirm_{b}")
-    builder.button(text="🔙 Cancel", callback_data="menu_backup")
-    builder.adjust(1)
-    
-    await callback.message.edit_text(
-        "⚠️ **Restore Database**\n\n"
-        "This will overwrite the current database with the selected backup.\n"
-        "**This action is irreversible!**\n\n"
-        "Select a backup:",
-        reply_markup=builder.as_markup()
-    )
-    await callback.answer()
-
-@router.callback_query(lambda c: c.data.startswith("backup_restore_confirm_"))
-@admin_callback
-async def backup_restore_execute(callback: CallbackQuery):
-    filename = callback.data[23:]
-    filepath = os.path.join(BACKUP_DIR, filename)
-    
-    if not os.path.exists(filepath):
-        await callback.answer("Backup file not found.", show_alert=True)
-        return
-    
-    # Pre-restore backup
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    pre_restore = os.path.join(BACKUP_DIR, f"pre_restore_{timestamp}.db")
-    shutil.copy2(DATABASE_PATH, pre_restore)
-    
-    # Restore
-    shutil.copy2(filepath, DATABASE_PATH)
-    
-    await log_admin_action(callback.from_user.id, "restore", f"from:{filename}", f"pre_backup:{pre_restore}")
-    
-    await callback.message.edit_text(
-        f"✅ Database restored from `{filename}`.\n"
-        f"A backup of the previous database was saved as `{pre_restore}`.",
-        reply_markup=main_menu_keyboard()
-    )
-    await callback.answer()
-
-# =================================================================================
-#                                    EXPORT KEYS
-# =================================================================================
-@router.callback_query(lambda c: c.data == "menu_export")
-@admin_callback
-async def menu_export(callback: CallbackQuery):
-    builder = InlineKeyboardBuilder()
-    builder.button(text="📄 Export as JSON", callback_data="export_json")
-    builder.button(text="📊 Export as CSV", callback_data="export_csv")
-    builder.button(text="📋 Export Active Keys", callback_data="export_active")
-    builder.button(text="📤 Export Full DB", callback_data="export_db")
-    builder.button(text="🔙 Main Menu", callback_data="back_main")
-    builder.adjust(2)
-    
-    await callback.message.edit_text(
-        "📤 **Export Data**\n\nChoose format:",
-        reply_markup=builder.as_markup()
-    )
-    await callback.answer()
-
-@router.callback_query(lambda c: c.data == "export_json")
-@admin_callback
-async def export_json(callback: CallbackQuery):
-    async with await get_db() as db:
-        cursor = await db.execute("""
-            SELECT key_id, issued_to, issued_by, max_instances, usage_count, expiry, note, created_at, is_active
-            FROM core_keys ORDER BY created_at DESC
-        """)
-        rows = await cursor.fetchall()
-    
-    data = []
-    for row in rows:
-        data.append({
-            "key_id": row["key_id"],
-            "issued_to": row["issued_to"],
-            "issued_by": row["issued_by"],
-            "max_instances": row["max_instances"],
-            "usage_count": row["usage_count"],
-            "expiry": row["expiry"],
-            "note": row["note"],
-            "created_at": row["created_at"],
-            "is_active": bool(row["is_active"])
-        })
-    
-    json_str = json.dumps(data, indent=2, default=str)
-    filename = f"keys_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-    
-    await callback.message.reply_document(
-        BufferedInputFile(json_str.encode(), filename=filename),
-        caption=f"📄 Exported {len(data)} keys."
-    )
-    await callback.answer()
-
-@router.callback_query(lambda c: c.data == "export_csv")
-@admin_callback
-async def export_csv(callback: CallbackQuery):
-    async with await get_db() as db:
-        cursor = await db.execute("""
-            SELECT key_id, issued_to, max_instances, usage_count, expiry, note, created_at
-            FROM core_keys ORDER BY created_at DESC
-        """)
-        rows = await cursor.fetchall()
-    
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(["Key ID", "Issued To", "Max Instances", "Usage Count", "Expiry", "Note", "Created At"])
-    for row in rows:
-        writer.writerow([
-            row["key_id"],
-            row["issued_to"],
-            row["max_instances"],
-            row["usage_count"],
-            row["expiry"],
-            row["note"] or "",
-            row["created_at"]
-        ])
-    
-    csv_data = output.getvalue().encode('utf-8')
-    filename = f"keys_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    
-    await callback.message.reply_document(
-        BufferedInputFile(csv_data, filename=filename),
-        caption=f"📊 Exported {len(rows)} keys."
-    )
-    await callback.answer()
-
-@router.callback_query(lambda c: c.data == "export_active")
-@admin_callback
-async def export_active(callback: CallbackQuery):
-    async with await get_db() as db:
-        cursor = await db.execute("""
-            SELECT key_id, issued_to, max_instances, usage_count, expiry, note
-            FROM core_keys WHERE is_active = 1 AND expiry > datetime('now')
-            ORDER BY created_at DESC
-        """)
-        rows = await cursor.fetchall()
-    
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(["Key ID", "Issued To", "Max Instances", "Usage Count", "Expiry", "Note"])
-    for row in rows:
-        writer.writerow([
-            row["key_id"],
-            row["issued_to"],
-            row["max_instances"],
-            row["usage_count"],
-            row["expiry"],
-            row["note"] or ""
-        ])
-    
-    csv_data = output.getvalue().encode('utf-8')
-    filename = f"active_keys_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    
-    await callback.message.reply_document(
-        BufferedInputFile(csv_data, filename=filename),
-        caption=f"📋 Exported {len(rows)} active keys."
-    )
-    await callback.answer()
-
-@router.callback_query(lambda c: c.data == "export_db")
-@admin_callback
-async def export_db(callback: CallbackQuery):
-    with open(DATABASE_PATH, 'rb') as f:
-        await callback.message.reply_document(
-            BufferedInputFile(f.read(), filename=f"admin_bot_full_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"),
-            caption="📦 Full database export."
-        )
-    await callback.answer()
-
-# =================================================================================
-#                                    LOGS VIEWER
-# =================================================================================
-@router.callback_query(lambda c: c.data.startswith("menu_logs_"))
-@admin_callback
-async def menu_logs(callback: CallbackQuery):
-    page = int(callback.data.split("_")[2])
-    per_page = 15
-    
-    async with await get_db() as db:
-        cursor = await db.execute("""
-            SELECT timestamp, admin_id, action, target, details
-            FROM admin_logs
-            ORDER BY timestamp DESC
-            LIMIT ? OFFSET ?
-        """, (per_page, page * per_page))
-        logs = await cursor.fetchall()
-        
-        total = (await db.execute_fetchone("SELECT COUNT(*) FROM admin_logs"))[0]
-    
-    total_pages = (total + per_page - 1) // per_page if total else 1
-    
-    if not logs:
-        await callback.message.edit_text("No logs found.", reply_markup=main_menu_keyboard())
-        await callback.answer()
-        return
-    
-    text = f"📜 **Admin Logs** (Page {page+1}/{total_pages})\n\n"
-    for log in logs:
-        text += f"`{log['timestamp'][:19]}` • {log['action']}\n"
-        text += f"  🎯 {log['target']}\n"
-        if log['details']:
-            text += f"  📝 {log['details'][:50]}\n"
-        text += "\n"
-    
-    kb = pagination_keyboard("menu_logs", page, total_pages)
-    await callback.message.edit_text(text, reply_markup=kb)
-    await callback.answer()
-
-# =================================================================================
-#                                    SETTINGS
-# =================================================================================
-@router.callback_query(lambda c: c.data == "menu_settings")
-@admin_callback
-async def menu_settings(callback: CallbackQuery):
-    me = await bot.get_me()
-    
-    text = (
-        "⚙️ **Bot Settings**\n\n"
-        f"**Bot Username:** @{me.username}\n"
-        f"**Bot ID:** `{me.id}`\n"
-        f"**Admin IDs:** {', '.join(map(str, ADMIN_IDS))}\n"
-        f"**Database:** `{DATABASE_PATH}`\n"
-        f"**Backup Dir:** `{BACKUP_DIR}`\n"
-        f"**Health Port:** `{HEALTH_CHECK_PORT}`\n\n"
-        "**Actions:**"
-    )
-    
-    builder = InlineKeyboardBuilder()
-    builder.button(text="📥 Download Logs", callback_data="settings_download_logs")
-    builder.button(text="🧪 Test", callback_data="settings_test")
-    builder.button(text="🔙 Main Menu", callback_data="back_main")
-    builder.adjust(2)
-    
-    await callback.message.edit_text(text, reply_markup=builder.as_markup())
-    await callback.answer()
-
-@router.callback_query(lambda c: c.data == "settings_download_logs")
-@admin_callback
-async def settings_download_logs(callback: CallbackQuery):
-    if os.path.exists("admin_bot.log"):
-        with open("admin_bot.log", 'rb') as f:
-            await callback.message.reply_document(
-                BufferedInputFile(f.read(), filename="admin_bot.log"),
-                caption="📋 Bot log file."
+def init_db():
+    with get_db() as conn:
+        # Settings (key‑value)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
             )
+        """)
+        # Insert default port range if not exists
+        conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('port_min', ?)", (str(PORT_MIN),))
+        conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('port_max', ?)", (str(PORT_MAX),))
+
+        # Core keys
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS core_keys (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                key TEXT UNIQUE NOT NULL,
+                duration_days INTEGER NOT NULL,
+                max_servers INTEGER NOT NULL,
+                used_count INTEGER DEFAULT 0,
+                created_by INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                is_active INTEGER DEFAULT 1
+            )
+        """)
+        # User instances
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS instances (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                instance_uuid TEXT UNIQUE NOT NULL,
+                user_id INTEGER NOT NULL,
+                port INTEGER UNIQUE NOT NULL,
+                password TEXT NOT NULL,
+                directory TEXT NOT NULL,
+                pid INTEGER,
+                status TEXT DEFAULT 'stopped',
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                core_key_id INTEGER,
+                renewed_from INTEGER,  -- if this instance is a renewal, store original instance id
+                FOREIGN KEY(core_key_id) REFERENCES core_keys(id)
+            )
+        """)
+        # Telegram users
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER UNIQUE NOT NULL,
+                first_name TEXT,
+                username TEXT,
+                created_at INTEGER,
+                last_interaction INTEGER,
+                blocked INTEGER DEFAULT 0
+            )
+        """)
+        # Logs
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                user_id INTEGER,
+                details TEXT
+            )
+        """)
+        conn.commit()
+    logger.info("Database initialized")
+
+# ---------- Settings ----------
+def get_setting(key, default=None):
+    with get_db() as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else default
+
+def set_setting(key, value):
+    with get_db() as conn:
+        conn.execute("REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
+        conn.commit()
+
+# ---------- Core Keys ----------
+def generate_core_key(duration_days, max_servers, admin_id):
+    key = "CORE-" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=12))
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO core_keys (key, duration_days, max_servers, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
+            (key, duration_days, max_servers, admin_id, int(time.time()))
+        )
+        conn.commit()
+    return key
+
+def get_core_key(key_str):
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM core_keys WHERE key = ? AND is_active = 1", (key_str,)).fetchone()
+    return dict(row) if row else None
+
+def increment_key_usage(key_id):
+    with get_db() as conn:
+        key = conn.execute("SELECT used_count, max_servers FROM core_keys WHERE id = ?", (key_id,)).fetchone()
+        if key:
+            used = key["used_count"] + 1
+            conn.execute("UPDATE core_keys SET used_count = ? WHERE id = ?", (used, key_id))
+            if used >= key["max_servers"]:
+                conn.execute("UPDATE core_keys SET is_active = 0 WHERE id = ?", (key_id,))
+        conn.commit()
+
+def deactivate_core_key(key_id):
+    with get_db() as conn:
+        conn.execute("UPDATE core_keys SET is_active = 0 WHERE id = ?", (key_id,))
+        conn.commit()
+
+def list_core_keys(active_only=True):
+    with get_db() as conn:
+        if active_only:
+            rows = conn.execute("SELECT * FROM core_keys WHERE is_active = 1 ORDER BY created_at DESC").fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM core_keys ORDER BY created_at DESC").fetchall()
+    return [dict(r) for r in rows]
+
+# ---------- Instances ----------
+def get_available_port():
+    """Return a free port within the current range."""
+    port_min = int(get_setting("port_min", PORT_MIN))
+    port_max = int(get_setting("port_max", PORT_MAX))
+    used_ports = set()
+    with get_db() as conn:
+        used = conn.execute("SELECT port FROM instances").fetchall()
+        used_ports = {r["port"] for r in used}
+    for port in range(port_min, port_max + 1):
+        if port not in used_ports and is_port_available(port):
+            return port
+    raise RuntimeError(f"No free ports in range {port_min}-{port_max}")
+
+def create_instance(user_id, core_key_id, duration_days, renewed_instance_id=None):
+    """Create a new instance or renew an existing one."""
+    if renewed_instance_id:
+        # Renew existing instance
+        with get_db() as conn:
+            inst = conn.execute("SELECT * FROM instances WHERE id = ?", (renewed_instance_id,)).fetchone()
+            if not inst:
+                raise ValueError("Instance not found")
+            # Update expiry and status
+            new_expires = int((datetime.now() + timedelta(days=duration_days)).timestamp())
+            conn.execute(
+                "UPDATE instances SET expires_at = ?, status = 'stopped', core_key_id = ? WHERE id = ?",
+                (new_expires, core_key_id, renewed_instance_id)
+            )
+            conn.commit()
+            return renewed_instance_id, inst["port"], inst["password"], inst["directory"]
     else:
-        await callback.answer("Log file not found.", show_alert=True)
-    await callback.answer()
+        # Create brand new instance
+        port = get_available_port()
+        password = ''.join(random.choices(string.ascii_letters + string.digits, k=12))
+        instance_uuid = str(uuid.uuid4())[:12]
+        directory = f"instances/{instance_uuid}"
+        os.makedirs(directory, exist_ok=True)
 
-@router.callback_query(lambda c: c.data == "settings_test")
-@admin_callback
-async def settings_test(callback: CallbackQuery):
-    await callback.answer("✅ Test successful!", show_alert=True)
+        created_at = int(time.time())
+        expires_at = int((datetime.now() + timedelta(days=duration_days)).timestamp())
 
-# =================================================================================
-#                                    ERROR HANDLER
-# =================================================================================
-@dp.error()
-async def error_handler(event: types.ErrorEvent):
-    logger.exception(f"Update {event.update} caused error {event.exception}")
-    return True
+        with get_db() as conn:
+            conn.execute("""
+                INSERT INTO instances
+                (instance_uuid, user_id, port, password, directory, created_at, expires_at, core_key_id, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (instance_uuid, user_id, port, password, directory, created_at, expires_at, core_key_id, 'stopped'))
+            conn.commit()
+            instance_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        return instance_id, port, password, directory
 
-# =================================================================================
-#                                    STARTUP
-# =================================================================================
-async def on_startup():
-    await init_db()
-    asyncio.create_task(start_health_server())
-    logger.info("Bot started and health server running.")
+def get_instance(instance_id):
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM instances WHERE id = ?", (instance_id,)).fetchone()
+    return dict(row) if row else None
 
-async def main():
-    dp.startup.register(on_startup)
-    await dp.start_polling(bot)
+def get_user_instances(user_id, active_only=False, include_expired=False):
+    with get_db() as conn:
+        query = "SELECT * FROM instances WHERE user_id = ?"
+        params = [user_id]
+        if active_only:
+            query += " AND status = 'running' AND expires_at > ?"
+            params.append(int(time.time()))
+        if not include_expired:
+            query += " AND expires_at > ?"
+            params.append(int(time.time()))
+        query += " ORDER BY created_at DESC"
+        rows = conn.execute(query, params).fetchall()
+    return [dict(r) for r in rows]
+
+def get_all_instances(limit=50):
+    with get_db() as conn:
+        rows = conn.execute("SELECT * FROM instances ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+def update_instance_status(instance_id, status, pid=None):
+    with get_db() as conn:
+        if pid is not None:
+            conn.execute("UPDATE instances SET status = ?, pid = ? WHERE id = ?", (status, pid, instance_id))
+        else:
+            conn.execute("UPDATE instances SET status = ? WHERE id = ?", (status, instance_id))
+        conn.commit()
+
+def delete_instance(instance_id):
+    stop_file_server(instance_id)
+    with get_db() as conn:
+        row = conn.execute("SELECT directory FROM instances WHERE id = ?", (instance_id,)).fetchone()
+        if row:
+            import shutil
+            shutil.rmtree(row["directory"], ignore_errors=True)
+        conn.execute("DELETE FROM instances WHERE id = ?", (instance_id,))
+        conn.commit()
+
+def count_user_active_servers(user_id):
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) as cnt FROM instances WHERE user_id = ? AND status = 'running' AND expires_at > ?",
+            (user_id, int(time.time()))
+        ).fetchone()
+    return row["cnt"] if row else 0
+
+def get_expired_instances_for_user(user_id):
+    """Return instances that have expired and are not running."""
+    now = int(time.time())
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM instances WHERE user_id = ? AND expires_at <= ? AND status != 'running' ORDER BY created_at DESC",
+            (user_id, now)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+# ---------- Users ----------
+def update_user(user_id, first_name, username):
+    with get_db() as conn:
+        now = int(time.time())
+        conn.execute("""
+            INSERT INTO users (user_id, first_name, username, created_at, last_interaction, blocked)
+            VALUES (?, ?, ?, ?, ?, 0)
+            ON CONFLICT(user_id) DO UPDATE SET
+                first_name = excluded.first_name,
+                username = excluded.username,
+                last_interaction = excluded.last_interaction
+        """, (user_id, first_name, username, now, now))
+        conn.commit()
+
+def get_user(user_id):
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    return dict(row) if row else None
+
+def is_user_blocked(user_id):
+    user = get_user(user_id)
+    return user and user.get("blocked", 0) == 1
+
+def block_user(user_id):
+    with get_db() as conn:
+        conn.execute("UPDATE users SET blocked = 1 WHERE user_id = ?", (user_id,))
+        conn.commit()
+    # Stop all running instances
+    for inst in get_user_instances(user_id, active_only=True):
+        stop_file_server(inst["id"])
+
+def unblock_user(user_id):
+    with get_db() as conn:
+        conn.execute("UPDATE users SET blocked = 0 WHERE user_id = ?", (user_id,))
+        conn.commit()
+
+def get_all_users(limit=50):
+    with get_db() as conn:
+        rows = conn.execute("SELECT * FROM users ORDER BY last_interaction DESC LIMIT ?", (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+# ---------- Logging ----------
+def log_action(action, user_id=None, details=None):
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO logs (timestamp, action, user_id, details) VALUES (?, ?, ?, ?)",
+            (int(time.time()), action, user_id, details)
+        )
+        conn.commit()
+
+# ---------- Statistics ----------
+def get_stats():
+    with get_db() as conn:
+        total_keys = conn.execute("SELECT COUNT(*) FROM core_keys").fetchone()[0]
+        active_keys = conn.execute("SELECT COUNT(*) FROM core_keys WHERE is_active=1").fetchone()[0]
+        total_instances = conn.execute("SELECT COUNT(*) FROM instances").fetchone()[0]
+        running_instances = conn.execute("SELECT COUNT(*) FROM instances WHERE status='running'").fetchone()[0]
+        expired_instances = conn.execute("SELECT COUNT(*) FROM instances WHERE expires_at <= ?", (int(time.time()),)).fetchone()[0]
+        total_users = conn.execute("SELECT COUNT(DISTINCT user_id) FROM users").fetchone()[0]
+        blocked_users = conn.execute("SELECT COUNT(*) FROM users WHERE blocked=1").fetchone()[0]
+    stats = {
+        "total_keys": total_keys,
+        "active_keys": active_keys,
+        "total_instances": total_instances,
+        "running_instances": running_instances,
+        "expired_instances": expired_instances,
+        "total_users": total_users,
+        "blocked_users": blocked_users,
+    }
+    if PSUTIL_AVAILABLE:
+        stats["cpu"] = psutil.cpu_percent()
+        stats["ram"] = psutil.virtual_memory().percent
+        stats["disk"] = psutil.disk_usage('/').percent
+    return stats
+
+# ==================== UTILITY FUNCTIONS ====================
+
+def is_port_available(port):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("127.0.0.1", port))
+            return True
+        except socket.error:
+            return False
+
+def is_owner(user_id):
+    return user_id == OWNER_ID
+
+# ==================== FILE SERVER ====================
+
+class FileServerHandler(SimpleHTTPRequestHandler):
+    def __init__(self, *args, directory=None, password=None, **kwargs):
+        self.server_password = password
+        super().__init__(*args, directory=directory, **kwargs)
+
+    def authenticate(self):
+        auth_header = self.headers.get('Authorization')
+        if not auth_header:
+            self.send_response(401)
+            self.send_header('WWW-Authenticate', 'Basic realm="VPS"')
+            self.end_headers()
+            return False
+        auth_type, credentials = auth_header.split()
+        if auth_type.lower() != 'basic':
+            return False
+        decoded = base64.b64decode(credentials).decode('utf-8')
+        _, password = decoded.split(':', 1)
+        return password == self.server_password
+
+    def send_head(self):
+        if not self.authenticate():
+            return None
+        return super().send_head()
+
+    def do_GET(self):
+        if not self.authenticate():
+            return
+        super().do_GET()
+
+    def do_POST(self):
+        if not self.authenticate():
+            return
+        content_length = int(self.headers.get('Content-Length', 0))
+        content_type = self.headers.get('Content-Type', '')
+        if 'multipart/form-data' in content_type:
+            import cgi
+            form = cgi.FieldStorage(
+                fp=self.rfile,
+                headers=self.headers,
+                environ={'REQUEST_METHOD': 'POST'}
+            )
+            file_item = form['file']
+            if file_item.filename:
+                filename = os.path.basename(file_item.filename)
+                filepath = os.path.join(self.directory, filename)
+                with open(filepath, 'wb') as f:
+                    f.write(file_item.file.read())
+                self.send_response(200)
+                self.send_header('Content-type', 'text/html')
+                self.end_headers()
+                self.wfile.write(b'Upload successful')
+                return
+        self.send_response(400)
+        self.end_headers()
+        self.wfile.write(b'No file uploaded')
+
+    def log_message(self, format, *args):
+        pass
+
+def run_file_server(port, password, directory):
+    server_address = ('127.0.0.1', port)
+    handler = lambda *args, **kwargs: FileServerHandler(
+        *args, directory=directory, password=password, **kwargs
+    )
+    httpd = HTTPServer(server_address, handler)
+    httpd.serve_forever()
+
+def start_file_server(instance_id):
+    inst = get_instance(instance_id)
+    if not inst:
+        return False, "Instance not found"
+    if is_user_blocked(inst["user_id"]):
+        return False, "Your account is blocked. Contact admin."
+    if inst['status'] == 'running':
+        return False, "Already running"
+    if not os.path.exists(inst['directory']):
+        os.makedirs(inst['directory'], exist_ok=True)
+
+    proc = subprocess.Popen(
+        [sys.executable, '-c',
+         f"import sys; sys.path.append('.'); from main import run_file_server; run_file_server({inst['port']}, '{inst['password']}', '{inst['directory']}')"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+    time.sleep(0.5)
+    if proc.poll() is None:
+        update_instance_status(instance_id, 'running', proc.pid)
+        log_action("start_instance", inst['user_id'], f"instance={instance_id}")
+        return True, f"Server started on http://127.0.0.1:{inst['port']}"
+    else:
+        return False, "Failed to start server"
+
+def stop_file_server(instance_id):
+    inst = get_instance(instance_id)
+    if not inst:
+        return False, "Instance not found"
+    if inst['status'] != 'running' or not inst['pid']:
+        update_instance_status(instance_id, 'stopped')
+        return True, "Already stopped"
+    try:
+        os.kill(inst['pid'], signal.SIGTERM)
+        time.sleep(0.3)
+        update_instance_status(instance_id, 'stopped', None)
+        log_action("stop_instance", inst['user_id'], f"instance={instance_id}")
+        return True, "Server stopped"
+    except ProcessLookupError:
+        update_instance_status(instance_id, 'stopped', None)
+        return True, "Server process not found, marked stopped"
+    except Exception as e:
+        return False, f"Error: {e}"
+
+def restart_file_server(instance_id):
+    stop_file_server(instance_id)
+    time.sleep(0.5)
+    return start_file_server(instance_id)
+
+# ==================== BACKGROUND EXPIRY CHECKER ====================
+
+def expiry_checker():
+    while True:
+        try:
+            now = int(time.time())
+            with get_db() as conn:
+                expired = conn.execute(
+                    "SELECT * FROM instances WHERE expires_at <= ? AND status = 'running'",
+                    (now,)
+                ).fetchall()
+                for inst in expired:
+                    stop_file_server(inst['id'])
+                    try:
+                        bot.send_message(
+                            inst['user_id'],
+                            f"⚠️ Your VPS (port {inst['port']}) has expired and has been stopped.\n"
+                            "You can renew it with a new Core Key."
+                        )
+                    except:
+                        pass
+                    log_action("auto_expire", inst['user_id'], f"instance={inst['id']}")
+        except Exception as e:
+            logger.error(f"Expiry checker error: {e}")
+        time.sleep(60)
+
+# ==================== TELEGRAM BOT ====================
+
+bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
+
+# ---------- Persistent Keyboards ----------
+def main_menu(user_id):
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add(
+        KeyboardButton("🖥 My VPS"),
+        KeyboardButton("🔑 Redeem Key")
+    )
+    if is_owner(user_id):
+        markup.add(KeyboardButton("⚙️ Admin Panel"))
+    markup.add(KeyboardButton("📞 Help"))
+    return markup
+
+def admin_menu():
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add(
+        KeyboardButton("🔐 Generate Key"),
+        KeyboardButton("🗝 List Keys"),
+        KeyboardButton("📋 All Instances"),
+        KeyboardButton("👥 User Management"),
+        KeyboardButton("🔧 Settings"),
+        KeyboardButton("📊 Detailed Stats"),
+        KeyboardButton("🔙 Back")
+    )
+    return markup
+
+def back_menu():
+    markup = ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add(KeyboardButton("🔙 Back"))
+    return markup
+
+# ---------- Message Editing Helper ----------
+def edit_or_send(chat_id, text, reply_markup=None, parse_mode=None, message_id=None):
+    if message_id:
+        try:
+            bot.edit_message_text(text, chat_id, message_id, reply_markup=reply_markup, parse_mode=parse_mode)
+            return message_id
+        except:
+            pass
+    msg = bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode=parse_mode)
+    return msg.message_id
+
+# ---------- Handlers ----------
+@bot.message_handler(commands=['start'])
+def start_cmd(message):
+    user_id = message.from_user.id
+    if is_user_blocked(user_id):
+        bot.send_message(message.chat.id, "❌ Your account is blocked. Contact admin.")
+        return
+    update_user(user_id, message.from_user.first_name, message.from_user.username)
+    bot.send_message(
+        message.chat.id,
+        f"🚀 Welcome to Personal VPS Bot (Instance: {INSTANCE_ID})\n"
+        "Redeem a Core Key to get your own private file server.\n"
+        "Use the menu below.",
+        reply_markup=main_menu(user_id)
+    )
+    log_action("/start", user_id)
+
+@bot.message_handler(func=lambda m: m.text == "🔙 Back")
+def back_handler(message):
+    user_id = message.from_user.id
+    bot.send_message(
+        message.chat.id,
+        "Main menu:",
+        reply_markup=main_menu(user_id)
+    )
+
+@bot.message_handler(func=lambda m: m.text == "📞 Help")
+def help_handler(message):
+    text = (
+        "📘 **How to use**\n\n"
+        "• **Redeem Key** – Enter a Core Key to create or renew a VPS.\n"
+        "• **My VPS** – View and manage your active servers.\n"
+        "• Each VPS is a file server with password protection.\n"
+        "• Upload/download files via web browser.\n"
+        "• Servers auto‑expire after the key's duration.\n"
+        "• **Renewal**: If you have an expired server, redeeming a key will ask if you want to renew it.\n\n"
+        "Admin commands are shown if you are the owner."
+    )
+    bot.send_message(message.chat.id, text, parse_mode="Markdown")
+
+# ---------- Redeem Key (with Renewal) ----------
+@bot.message_handler(func=lambda m: m.text == "🔑 Redeem Key")
+def redeem_prompt(message):
+    user_id = message.from_user.id
+    if is_user_blocked(user_id):
+        bot.send_message(message.chat.id, "❌ You are blocked. Contact admin.", reply_markup=main_menu(user_id))
+        return
+    msg = bot.send_message(message.chat.id, "Please enter your Core Key:", reply_markup=back_menu())
+    bot.register_next_step_handler(msg, process_redeem)
+
+def process_redeem(message):
+    user_id = message.from_user.id
+    if is_user_blocked(user_id):
+        bot.send_message(message.chat.id, "❌ Blocked.", reply_markup=main_menu(user_id))
+        return
+    if message.text == "🔙 Back":
+        bot.send_message(message.chat.id, "Cancelled.", reply_markup=main_menu(user_id))
+        return
+    key_str = message.text.strip()
+    core_key = get_core_key(key_str)
+    if not core_key:
+        bot.send_message(message.chat.id, "❌ Invalid or expired Core Key.", reply_markup=main_menu(user_id))
+        return
+
+    # Check if user has any expired servers that can be renewed
+    expired_instances = get_expired_instances_for_user(user_id)
+    if expired_instances:
+        # Offer renewal
+        markup = InlineKeyboardMarkup()
+        for inst in expired_instances[:5]:  # limit to 5
+            expires = datetime.fromtimestamp(inst['expires_at']).strftime("%Y-%m-%d")
+            btn_text = f"Renew port {inst['port']} (expired {expires})"
+            markup.add(InlineKeyboardButton(btn_text, callback_data=f"renew:{inst['id']}:{key_str}"))
+        markup.add(InlineKeyboardButton("➕ Create New Server", callback_data=f"new:{key_str}"))
+        markup.add(InlineKeyboardButton("❌ Cancel", callback_data="cancel_renew"))
+        bot.send_message(
+            message.chat.id,
+            "You have expired servers. Choose one to renew, or create a new one:",
+            reply_markup=markup
+        )
+        return
+
+    # No expired servers, proceed to create new
+    create_new_server(user_id, core_key, message.chat.id)
+
+def create_new_server(user_id, core_key, chat_id):
+    # Check user not blocked
+    if is_user_blocked(user_id):
+        bot.send_message(chat_id, "❌ Blocked.", reply_markup=main_menu(user_id))
+        return
+    # Check server limit for this key
+    active_count = count_user_active_servers(user_id)
+    if active_count >= core_key['max_servers']:
+        bot.send_message(
+            chat_id,
+            f"❌ You already have {active_count} active server(s). "
+            f"This key allows max {core_key['max_servers']}.",
+            reply_markup=main_menu(user_id)
+        )
+        return
+    try:
+        instance_id, port, password, directory = create_instance(
+            user_id, core_key['id'], core_key['duration_days']
+        )
+        increment_key_usage(core_key['id'])
+        success, msg_text = start_file_server(instance_id)
+        if success:
+            bot.send_message(
+                chat_id,
+                f"✅ **VPS Created Successfully!**\n\n"
+                f"🌐 **Address:** `http://127.0.0.1:{port}`\n"
+                f"🔑 **Password:** `{password}`\n"
+                f"📁 **Root Directory:** `{directory}`\n"
+                f"⏳ **Expires:** {datetime.fromtimestamp(int(time.time()) + core_key['duration_days']*86400).strftime('%Y-%m-%d %H:%M')}\n\n"
+                f"Use the password to login via browser.",
+                parse_mode="Markdown",
+                reply_markup=main_menu(user_id)
+            )
+            log_action("redeem_key_new", user_id, f"key={core_key['key']}, instance={instance_id}")
+        else:
+            bot.send_message(chat_id, f"❌ Server created but failed to start: {msg_text}", reply_markup=main_menu(user_id))
+    except Exception as e:
+        bot.send_message(chat_id, f"❌ Error creating VPS: {e}", reply_markup=main_menu(user_id))
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("renew:"))
+def renew_instance_cb(call):
+    _, instance_id, key_str = call.data.split(":", 2)
+    instance_id = int(instance_id)
+    user_id = call.from_user.id
+    core_key = get_core_key(key_str)
+    if not core_key:
+        bot.answer_callback_query(call.id, "Key invalid or expired.", show_alert=True)
+        return
+    # Check ownership
+    inst = get_instance(instance_id)
+    if not inst or inst['user_id'] != user_id:
+        bot.answer_callback_query(call.id, "Not your instance.", show_alert=True)
+        return
+    # Renew
+    try:
+        instance_id, port, password, directory = create_instance(
+            user_id, core_key['id'], core_key['duration_days'], renewed_instance_id=instance_id
+        )
+        increment_key_usage(core_key['id'])
+        success, msg_text = start_file_server(instance_id)
+        if success:
+            bot.edit_message_text(
+                f"✅ **VPS Renewed Successfully!**\n\n"
+                f"🌐 **Address:** `http://127.0.0.1:{port}`\n"
+                f"🔑 **Password:** `{password}` (unchanged)\n"
+                f"⏳ **New Expiry:** {datetime.fromtimestamp(inst['expires_at']).strftime('%Y-%m-%d %H:%M')}\n\n"
+                f"The server has been restarted.",
+                call.message.chat.id,
+                call.message.message_id,
+                parse_mode="Markdown"
+            )
+            log_action("renew_instance", user_id, f"key={core_key['key']}, instance={instance_id}")
+        else:
+            bot.edit_message_text(f"❌ Renewal failed: {msg_text}", call.message.chat.id, call.message.message_id)
+    except Exception as e:
+        bot.edit_message_text(f"❌ Error: {e}", call.message.chat.id, call.message.message_id)
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("new:"))
+def new_instance_cb(call):
+    _, key_str = call.data.split(":")
+    user_id = call.from_user.id
+    core_key = get_core_key(key_str)
+    if not core_key:
+        bot.answer_callback_query(call.id, "Key invalid.", show_alert=True)
+        return
+    bot.delete_message(call.message.chat.id, call.message.message_id)
+    create_new_server(user_id, core_key, call.message.chat.id)
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "cancel_renew")
+def cancel_renew_cb(call):
+    bot.edit_message_text("Cancelled.", call.message.chat.id, call.message.message_id)
+    bot.answer_callback_query(call.id)
+
+# ---------- My VPS ----------
+@bot.message_handler(func=lambda m: m.text == "🖥 My VPS")
+def my_vps(message):
+    user_id = message.from_user.id
+    if is_user_blocked(user_id):
+        bot.send_message(message.chat.id, "❌ Blocked.", reply_markup=main_menu(user_id))
+        return
+    instances = get_user_instances(user_id, include_expired=False)
+    if not instances:
+        bot.send_message(message.chat.id, "You have no active VPS instances.", reply_markup=main_menu(user_id))
+        return
+    markup = InlineKeyboardMarkup()
+    for inst in instances:
+        status = "🟢" if inst['status'] == 'running' else "🔴"
+        expires = datetime.fromtimestamp(inst['expires_at']).strftime("%m-%d %H:%M")
+        btn_text = f"{status} Port {inst['port']} (exp {expires})"
+        markup.add(InlineKeyboardButton(btn_text, callback_data=f"manage:{inst['id']}"))
+    bot.send_message(message.chat.id, "Your VPS instances:", reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("manage:"))
+def manage_instance(call):
+    instance_id = int(call.data.split(":")[1])
+    inst = get_instance(instance_id)
+    if not inst:
+        bot.answer_callback_query(call.id, "Instance not found.")
+        return
+    user_id = call.from_user.id
+    if inst['user_id'] != user_id and not is_owner(user_id):
+        bot.answer_callback_query(call.id, "Access denied.")
+        return
+
+    expires_str = datetime.fromtimestamp(inst['expires_at']).strftime("%Y-%m-%d %H:%M")
+    text = (
+        f"**VPS Details**\n"
+        f"Port: `{inst['port']}`\n"
+        f"Password: `{inst['password']}`\n"
+        f"Status: {'🟢 Running' if inst['status'] == 'running' else '🔴 Stopped'}\n"
+        f"Expires: {expires_str}\n"
+        f"Directory: `{inst['directory']}`\n"
+    )
+    markup = InlineKeyboardMarkup(row_width=2)
+    if inst['status'] == 'running':
+        markup.add(
+            InlineKeyboardButton("🛑 Stop", callback_data=f"stop:{instance_id}"),
+            InlineKeyboardButton("🔄 Restart", callback_data=f"restart:{instance_id}")
+        )
+    else:
+        # Only allow start if not expired
+        if inst['expires_at'] > int(time.time()):
+            markup.add(InlineKeyboardButton("▶️ Start", callback_data=f"start:{instance_id}"))
+        else:
+            text += "\n⚠️ This server has expired. Use a new Core Key to renew it."
+    markup.add(InlineKeyboardButton("🔗 Access Link", callback_data=f"link:{instance_id}"))
+    if is_owner(user_id) or inst['user_id'] == user_id:
+        markup.add(InlineKeyboardButton("🗑 Delete", callback_data=f"delete:{instance_id}"))
+    markup.add(InlineKeyboardButton("🔙 Back to list", callback_data="back_to_myvps"))
+
+    bot.edit_message_text(
+        text,
+        call.message.chat.id,
+        call.message.message_id,
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("start:"))
+def start_instance_cb(call):
+    instance_id = int(call.data.split(":")[1])
+    inst = get_instance(instance_id)
+    if inst['user_id'] != call.from_user.id and not is_owner(call.from_user.id):
+        bot.answer_callback_query(call.id, "Not allowed.")
+        return
+    success, msg = start_file_server(instance_id)
+    bot.answer_callback_query(call.id, msg, show_alert=True)
+    if success:
+        manage_instance(call)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("stop:"))
+def stop_instance_cb(call):
+    instance_id = int(call.data.split(":")[1])
+    inst = get_instance(instance_id)
+    if inst['user_id'] != call.from_user.id and not is_owner(call.from_user.id):
+        bot.answer_callback_query(call.id, "Not allowed.")
+        return
+    success, msg = stop_file_server(instance_id)
+    bot.answer_callback_query(call.id, msg, show_alert=True)
+    if success:
+        manage_instance(call)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("restart:"))
+def restart_instance_cb(call):
+    instance_id = int(call.data.split(":")[1])
+    inst = get_instance(instance_id)
+    if inst['user_id'] != call.from_user.id and not is_owner(call.from_user.id):
+        bot.answer_callback_query(call.id, "Not allowed.")
+        return
+    success, msg = restart_file_server(instance_id)
+    bot.answer_callback_query(call.id, msg, show_alert=True)
+    if success:
+        manage_instance(call)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("link:"))
+def link_instance_cb(call):
+    instance_id = int(call.data.split(":")[1])
+    inst = get_instance(instance_id)
+    if not inst:
+        bot.answer_callback_query(call.id, "Not found.")
+        return
+    text = f"🔗 **Access your VPS**\n\nURL: `http://127.0.0.1:{inst['port']}`\nPassword: `{inst['password']}`"
+    bot.edit_message_text(
+        text,
+        call.message.chat.id,
+        call.message.message_id,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup().add(
+            InlineKeyboardButton("🔙 Back to details", callback_data=f"manage:{instance_id}")
+        )
+    )
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("delete:"))
+def delete_instance_cb(call):
+    instance_id = int(call.data.split(":")[1])
+    inst = get_instance(instance_id)
+    if inst['user_id'] != call.from_user.id and not is_owner(call.from_user.id):
+        bot.answer_callback_query(call.id, "Not allowed.")
+        return
+    delete_instance(instance_id)
+    bot.answer_callback_query(call.id, "Instance deleted.", show_alert=True)
+    bot.delete_message(call.message.chat.id, call.message.message_id)
+    bot.send_message(call.message.chat.id, "Instance removed.", reply_markup=main_menu(call.from_user.id))
+
+@bot.callback_query_handler(func=lambda call: call.data == "back_to_myvps")
+def back_to_myvps(call):
+    my_vps(call.message)  # Re‑send list
+
+# ---------- Admin Panel ----------
+@bot.message_handler(func=lambda m: is_owner(m.from_user.id) and m.text == "⚙️ Admin Panel")
+def admin_panel(message):
+    bot.send_message(message.chat.id, "🛠 Admin Panel", reply_markup=admin_menu())
+
+@bot.message_handler(func=lambda m: is_owner(m.from_user.id) and m.text == "🔐 Generate Key")
+def gen_key_prompt(message):
+    msg = bot.send_message(
+        message.chat.id,
+        "Enter duration in days and max servers, separated by space.\n"
+        "Example: `30 2`  (30 days, 2 servers per key)",
+        parse_mode="Markdown",
+        reply_markup=back_menu()
+    )
+    bot.register_next_step_handler(msg, process_gen_key)
+
+def process_gen_key(message):
+    if message.text == "🔙 Back":
+        bot.send_message(message.chat.id, "Cancelled.", reply_markup=admin_menu())
+        return
+    try:
+        days, max_servers = map(int, message.text.split())
+        if days <= 0 or max_servers <= 0:
+            raise ValueError
+        key = generate_core_key(days, max_servers, message.from_user.id)
+        bot.send_message(
+            message.chat.id,
+            f"✅ Core Key generated:\n`{key}`\n\nDuration: {days} days\nMax servers: {max_servers}",
+            parse_mode="Markdown",
+            reply_markup=admin_menu()
+        )
+        log_action("generate_key", message.from_user.id, f"key={key}")
+    except:
+        bot.send_message(message.chat.id, "Invalid input. Use: days max_servers", reply_markup=admin_menu())
+
+@bot.message_handler(func=lambda m: is_owner(m.from_user.id) and m.text == "🗝 List Keys")
+def list_keys(message):
+    keys = list_core_keys(active_only=True)
+    if not keys:
+        bot.send_message(message.chat.id, "No active keys.", reply_markup=admin_menu())
+        return
+    text = "🔑 **Active Core Keys**\n\n"
+    for k in keys:
+        used = k['used_count']
+        max_srv = k['max_servers']
+        text += f"`{k['key']}` – {k['duration_days']}d, used {used}/{max_srv}\n"
+    bot.send_message(message.chat.id, text, parse_mode="Markdown", reply_markup=admin_menu())
+
+@bot.message_handler(func=lambda m: is_owner(m.from_user.id) and m.text == "📋 All Instances")
+def all_instances(message):
+    insts = get_all_instances(limit=20)
+    if not insts:
+        bot.send_message(message.chat.id, "No instances.", reply_markup=admin_menu())
+        return
+    text = "📋 **Recent Instances**\n\n"
+    for i in insts:
+        expires = datetime.fromtimestamp(i['expires_at']).strftime("%Y-%m-%d")
+        status_icon = "🟢" if i['status'] == 'running' else "🔴"
+        text += f"{status_icon} User `{i['user_id']}` – Port {i['port']} – expires {expires}\n"
+    bot.send_message(message.chat.id, text, parse_mode="Markdown", reply_markup=admin_menu())
+
+@bot.message_handler(func=lambda m: is_owner(m.from_user.id) and m.text == "👥 User Management")
+def user_management(message):
+    users = get_all_users(limit=10)
+    if not users:
+        bot.send_message(message.chat.id, "No users.", reply_markup=admin_menu())
+        return
+    text = "👥 **Recent Users**\n\n"
+    markup = InlineKeyboardMarkup()
+    for u in users:
+        blocked = "🔴 Blocked" if u['blocked'] else "🟢 Active"
+        btn_text = f"{u['user_id']} - {u.get('first_name','')[:10]} ({blocked})"
+        markup.add(InlineKeyboardButton(btn_text, callback_data=f"admin_user:{u['user_id']}"))
+    bot.send_message(message.chat.id, text, reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_user:"))
+def admin_user_detail(call):
+    user_id = int(call.data.split(":")[1])
+    user = get_user(user_id)
+    if not user:
+        bot.answer_callback_query(call.id, "User not found.")
+        return
+    instances = get_user_instances(user_id, include_expired=True)
+    active_count = sum(1 for i in instances if i['status'] == 'running' and i['expires_at'] > time.time())
+    text = (
+        f"👤 **User Details**\n"
+        f"ID: `{user_id}`\n"
+        f"Name: {user.get('first_name','')}\n"
+        f"Username: @{user.get('username','')}\n"
+        f"Joined: {datetime.fromtimestamp(user['created_at']).strftime('%Y-%m-%d')}\n"
+        f"Last interaction: {datetime.fromtimestamp(user['last_interaction']).strftime('%Y-%m-%d %H:%M')}\n"
+        f"Blocked: {'Yes' if user['blocked'] else 'No'}\n"
+        f"Total servers: {len(instances)}\n"
+        f"Active servers: {active_count}\n"
+    )
+    markup = InlineKeyboardMarkup()
+    if user['blocked']:
+        markup.add(InlineKeyboardButton("✅ Unblock", callback_data=f"admin_unblock:{user_id}"))
+    else:
+        markup.add(InlineKeyboardButton("❌ Block", callback_data=f"admin_block:{user_id}"))
+    markup.add(InlineKeyboardButton("🔙 Back to users", callback_data="admin_back_users"))
+    bot.edit_message_text(
+        text,
+        call.message.chat.id,
+        call.message.message_id,
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_block:"))
+def admin_block(call):
+    user_id = int(call.data.split(":")[1])
+    block_user(user_id)
+    bot.answer_callback_query(call.id, f"User {user_id} blocked.", show_alert=True)
+    # Refresh view
+    call.data = f"admin_user:{user_id}"
+    admin_user_detail(call)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_unblock:"))
+def admin_unblock(call):
+    user_id = int(call.data.split(":")[1])
+    unblock_user(user_id)
+    bot.answer_callback_query(call.id, f"User {user_id} unblocked.", show_alert=True)
+    call.data = f"admin_user:{user_id}"
+    admin_user_detail(call)
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_back_users")
+def admin_back_users(call):
+    user_management(call.message)
+
+@bot.message_handler(func=lambda m: is_owner(m.from_user.id) and m.text == "🔧 Settings")
+def settings_menu(message):
+    port_min = get_setting("port_min", PORT_MIN)
+    port_max = get_setting("port_max", PORT_MAX)
+    text = (
+        f"🔧 **Current Settings**\n\n"
+        f"Port range: `{port_min} – {port_max}`\n\n"
+        "Use buttons below to change."
+    )
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("✏️ Change Port Range", callback_data="admin_set_port"))
+    bot.send_message(message.chat.id, text, parse_mode="Markdown", reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_set_port")
+def admin_set_port_prompt(call):
+    msg = bot.send_message(
+        call.message.chat.id,
+        "Enter new port range (min max), e.g. `1999 9999`:\n"
+        "Both numbers must be between 1024 and 65535.",
+        parse_mode="Markdown"
+    )
+    bot.register_next_step_handler(msg, process_set_port)
+
+def process_set_port(message):
+    try:
+        min_port, max_port = map(int, message.text.split())
+        if min_port < 1024 or max_port > 65535 or min_port >= max_port:
+            raise ValueError
+        set_setting("port_min", min_port)
+        set_setting("port_max", max_port)
+        # Also update .env for persistence
+        set_key(ENV_FILE, "PORT_MIN", str(min_port))
+        set_key(ENV_FILE, "PORT_MAX", str(max_port))
+        bot.send_message(
+            message.chat.id,
+            f"✅ Port range updated to {min_port}-{max_port}",
+            reply_markup=admin_menu()
+        )
+        log_action("change_port_range", message.from_user.id, f"{min_port}-{max_port}")
+    except:
+        bot.send_message(message.chat.id, "Invalid range. Use: min max", reply_markup=admin_menu())
+
+@bot.message_handler(func=lambda m: is_owner(m.from_user.id) and m.text == "📊 Detailed Stats")
+def detailed_stats(message):
+    stats = get_stats()
+    text = (
+        f"📊 **System Statistics**\n\n"
+        f"🗝 **Keys**\n"
+        f"• Total: {stats['total_keys']}\n"
+        f"• Active: {stats['active_keys']}\n\n"
+        f"🖥 **Instances**\n"
+        f"• Total: {stats['total_instances']}\n"
+        f"• Running: {stats['running_instances']}\n"
+        f"• Expired: {stats['expired_instances']}\n\n"
+        f"👥 **Users**\n"
+        f"• Total: {stats['total_users']}\n"
+        f"• Blocked: {stats['blocked_users']}\n"
+    )
+    if PSUTIL_AVAILABLE:
+        text += (
+            f"\n🖥 **System Resources**\n"
+            f"• CPU: {stats['cpu']}%\n"
+            f"• RAM: {stats['ram']}%\n"
+            f"• Disk: {stats['disk']}%\n"
+        )
+    bot.send_message(message.chat.id, text, parse_mode="Markdown", reply_markup=admin_menu())
+
+# ---------- Fallback ----------
+@bot.message_handler(func=lambda m: True)
+def fallback(message):
+    user_id = message.from_user.id
+    bot.send_message(
+        message.chat.id,
+        "Please use the menu buttons.",
+        reply_markup=main_menu(user_id)
+    )
+
+# ==================== FLASK ADMIN WEB PANEL ====================
+
+app = Flask(__name__)
+app.secret_key = INSTANCE_SECRET
+
+# ---------- Auth ----------
+def verify_admin(core_key, instance_secret):
+    return core_key == os.getenv("CORE_KEY", "CHANGE_ME") and instance_secret == INSTANCE_SECRET
+
+@app.route('/')
+def index():
+    return redirect(url_for('admin_login'))
+
+@app.route('/admin/login', methods=['GET', 'POST'])
+def admin_login():
+    if request.method == 'POST':
+        core = request.form.get('core_key')
+        secret = request.form.get('instance_secret')
+        if verify_admin(core, secret):
+            session['admin'] = True
+            return redirect(url_for('admin_dashboard'))
+        else:
+            return "Invalid credentials", 403
+    return '''
+    <h2>Admin Login</h2>
+    <form method="post">
+        <label>Core Key:</label><br>
+        <input type="password" name="core_key"><br>
+        <label>Instance Secret:</label><br>
+        <input type="password" name="instance_secret"><br><br>
+        <input type="submit" value="Login">
+    </form>
+    '''
+
+def admin_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not session.get('admin'):
+            return redirect(url_for('admin_login'))
+        return f(*args, **kwargs)
+    return decorated
+
+@app.route('/admin/dashboard')
+@admin_required
+def admin_dashboard():
+    stats = get_stats()
+    port_min = get_setting("port_min", PORT_MIN)
+    port_max = get_setting("port_max", PORT_MAX)
+    html = f"""
+    <h2>Instance {INSTANCE_ID} Dashboard</h2>
+    <h3>System Overview</h3>
+    <ul>
+        <li>Total Keys: {stats['total_keys']}</li>
+        <li>Active Keys: {stats['active_keys']}</li>
+        <li>Total Instances: {stats['total_instances']}</li>
+        <li>Running Instances: {stats['running_instances']}</li>
+        <li>Total Users: {stats['total_users']}</li>
+        <li>Blocked Users: {stats['blocked_users']}</li>
+        <li>Port Range: {port_min} - {port_max}</li>
+    </ul>
+    <p><a href="/admin/instances">Manage Instances</a></p>
+    <p><a href="/admin/users">Manage Users</a></p>
+    <p><a href="/admin/keys">Core Keys</a></p>
+    <p><a href="/admin/settings">Settings</a></p>
+    <p><a href="/admin/export">Export Database</a></p>
+    """
+    return html
+
+@app.route('/admin/instances')
+@admin_required
+def admin_instances():
+    instances = get_all_instances(limit=100)
+    html = "<h2>All Instances</h2><table border='1'><tr><th>ID</th><th>User</th><th>Port</th><th>Status</th><th>Expires</th><th>Actions</th></tr>"
+    for i in instances:
+        expires = datetime.fromtimestamp(i['expires_at']).strftime("%Y-%m-%d %H:%M")
+        html += f"<tr><td>{i['id']}</td><td>{i['user_id']}</td><td>{i['port']}</td><td>{i['status']}</td><td>{expires}</td>"
+        html += f"<td><a href='/admin/instance/{i['id']}/stop'>Stop</a> | <a href='/admin/instance/{i['id']}/start'>Start</a> | <a href='/admin/instance/{i['id']}/delete'>Delete</a></td></tr>"
+    html += "</table><p><a href='/admin/dashboard'>Back</a></p>"
+    return html
+
+@app.route('/admin/instance/<int:instance_id>/<action>')
+@admin_required
+def admin_instance_action(instance_id, action):
+    if action == 'stop':
+        stop_file_server(instance_id)
+    elif action == 'start':
+        start_file_server(instance_id)
+    elif action == 'delete':
+        delete_instance(instance_id)
+    return redirect(url_for('admin_instances'))
+
+@app.route('/admin/users')
+@admin_required
+def admin_users():
+    users = get_all_users(limit=100)
+    html = "<h2>Users</h2><table border='1'><tr><th>User ID</th><th>Name</th><th>Username</th><th>Blocked</th><th>Actions</th></tr>"
+    for u in users:
+        html += f"<tr><td>{u['user_id']}</td><td>{u['first_name']}</td><td>{u['username']}</td><td>{u['blocked']}</td>"
+        if u['blocked']:
+            html += f"<td><a href='/admin/user/{u['user_id']}/unblock'>Unblock</a></td>"
+        else:
+            html += f"<td><a href='/admin/user/{u['user_id']}/block'>Block</a></td>"
+        html += "</tr>"
+    html += "</table><p><a href='/admin/dashboard'>Back</a></p>"
+    return html
+
+@app.route('/admin/user/<int:user_id>/block')
+@admin_required
+def admin_user_block(user_id):
+    block_user(user_id)
+    return redirect(url_for('admin_users'))
+
+@app.route('/admin/user/<int:user_id>/unblock')
+@admin_required
+def admin_user_unblock(user_id):
+    unblock_user(user_id)
+    return redirect(url_for('admin_users'))
+
+@app.route('/admin/keys')
+@admin_required
+def admin_keys():
+    keys = list_core_keys(active_only=False)
+    html = "<h2>Core Keys</h2><table border='1'><tr><th>Key</th><th>Duration</th><th>Max Servers</th><th>Used</th><th>Active</th><th>Created</th></tr>"
+    for k in keys:
+        created = datetime.fromtimestamp(k['created_at']).strftime("%Y-%m-%d")
+        html += f"<tr><td>{k['key']}</td><td>{k['duration_days']}d</td><td>{k['max_servers']}</td><td>{k['used_count']}</td><td>{k['is_active']}</td><td>{created}</td></tr>"
+    html += "</table><p><a href='/admin/dashboard'>Back</a></p>"
+    return html
+
+@app.route('/admin/settings', methods=['GET', 'POST'])
+@admin_required
+def admin_settings():
+    if request.method == 'POST':
+        min_port = request.form.get('port_min')
+        max_port = request.form.get('port_max')
+        try:
+            min_port = int(min_port)
+            max_port = int(max_port)
+            if 1024 <= min_port < max_port <= 65535:
+                set_setting("port_min", min_port)
+                set_setting("port_max", max_port)
+                set_key(ENV_FILE, "PORT_MIN", str(min_port))
+                set_key(ENV_FILE, "PORT_MAX", str(max_port))
+                return redirect(url_for('admin_settings'))
+        except:
+            pass
+    port_min = get_setting("port_min", PORT_MIN)
+    port_max = get_setting("port_max", PORT_MAX)
+    html = f"""
+    <h2>Settings</h2>
+    <form method="post">
+        <label>Port Min:</label><br>
+        <input type="number" name="port_min" value="{port_min}" min="1024" max="65535"><br>
+        <label>Port Max:</label><br>
+        <input type="number" name="port_max" value="{port_max}" min="1024" max="65535"><br><br>
+        <input type="submit" value="Save">
+    </form>
+    <p><a href='/admin/dashboard'>Back</a></p>
+    """
+    return html
+
+@app.route('/admin/export')
+@admin_required
+def admin_export():
+    return send_file(DB_FILE, as_attachment=True, download_name=f"instance_{INSTANCE_ID}.db")
+
+# ==================== MAIN ====================
+
+def run_flask():
+    logger.info(f"Starting Flask admin on http://127.0.0.1:{ADMIN_PORT}")
+    app.run(host="127.0.0.1", port=ADMIN_PORT, debug=False, use_reloader=False)
+
+def run_bot():
+    logger.info("Starting Telegram bot...")
+    try:
+        bot.infinity_polling()
+    except Exception as e:
+        logger.error(f"Bot polling error: {e}")
+
+def main():
+    init_db()
+    # Start expiry checker
+    threading.Thread(target=expiry_checker, daemon=True).start()
+    # Start bot thread
+    threading.Thread(target=run_bot, daemon=True).start()
+    # Run Flask in main thread
+    run_flask()
 
 if __name__ == "__main__":
-    logger.info("=" * 60)
-    logger.info("ULTIMATE ADMIN BOT – AIOGRAM 3.7+ – RENDER READY – FINAL FIX")
-    logger.info("=" * 60)
-    asyncio.run(main())
+    main()
