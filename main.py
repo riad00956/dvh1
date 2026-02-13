@@ -1,37 +1,30 @@
 #!/usr/bin/env python3
 """
-Telegram VPS Bot – Bangladesh Edition (Render Optimised)
-- Webhook only – no polling, no 409 conflicts
-- Auto‑detects Render URL & port
-- Custom login page (index.html)
-- Public file servers with cookie‑based session
+Telegram VPS Bot – Flask Integrated Version (Render Optimised)
+- সব ফাইল সার্ভিস Flask‑এর ভিতরে, আলাদা পোর্টের দরকার নেই
+- প্রতিটি VPS এর জন্য URL: https://yourdomain.com/vps/<instance_uuid>/
+- লগইন, ফাইল আপলোড/ডাউনলোড/ডিলিট – সব Flask রুট
+- Render‑এর 80/443 পোর্টেই কাজ করে
 """
 
 import os
 import sys
 import json
 import uuid
-import socket
 import logging
 import threading
 import sqlite3
 import random
 import string
 import time
-import signal
-import subprocess
 import hashlib
 import hmac
 from datetime import datetime, timedelta
 from functools import wraps
-from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, unquote
 import base64
 import html
 import shutil
-
-# 🔥 FIX: MISSING IMPORT
-from http.server import HTTPServer, SimpleHTTPRequestHandler
 
 # Third‑party
 from dotenv import load_dotenv, set_key
@@ -41,21 +34,19 @@ from telebot.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
     Update
 )
-from flask import Flask, request, session, redirect, url_for, send_file, abort, render_template_string
+from flask import (
+    Flask, request, session, redirect, url_for, 
+    send_file, abort, render_template_string, send_from_directory, make_response
+)
 
 # Optional
-try:
-    import psutil
-    PSUTIL_AVAILABLE = True
-except ImportError:
-    PSUTIL_AVAILABLE = False
 try:
     import requests
     REQUESTS_AVAILABLE = True
 except ImportError:
     REQUESTS_AVAILABLE = False
 
-# ==================== CONFIGURATION ====================
+# ==================== কনফিগারেশন ====================
 
 ENV_FILE = ".env"
 load_dotenv(ENV_FILE)
@@ -84,36 +75,21 @@ if not INSTANCE_SECRET:
     INSTANCE_SECRET = str(uuid.uuid4())
     set_key(ENV_FILE, "INSTANCE_SECRET", INSTANCE_SECRET)
 
-# 🌍 Public URL – auto‑detect from Render if not set
+# Render URL (স্বয়ংক্রিয়)
 PUBLIC_URL = os.getenv("PUBLIC_URL", "")
 if not PUBLIC_URL:
-    PUBLIC_URL = os.getenv("RENDER_EXTERNAL_URL", "")   # Render provides this
+    PUBLIC_URL = os.getenv("RENDER_EXTERNAL_URL", "")
     if PUBLIC_URL:
         os.environ["PUBLIC_URL"] = PUBLIC_URL
         set_key(ENV_FILE, "PUBLIC_URL", PUBLIC_URL)
 
-# Port configuration – Render uses $PORT
-WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", 8443))
-RENDER_PORT = os.getenv("PORT")          # Set by Render
-if RENDER_PORT:
-    WEBHOOK_PORT = int(RENDER_PORT)
+# Render পোর্ট
+PORT = int(os.getenv("PORT", 10000))  # Render $PORT
 
-# Default port range for file servers
-DEFAULT_PORT_MIN = 2000
-DEFAULT_PORT_MAX = 3000
-PORT_MIN = int(os.getenv("PORT_MIN", DEFAULT_PORT_MIN))
-PORT_MAX = int(os.getenv("PORT_MAX", DEFAULT_PORT_MAX))
-
-# Public host (auto‑detected)
-PUBLIC_HOST = os.getenv("PUBLIC_HOST", "")
-
-# Path to custom login page
-LOGIN_PAGE = "index.html"
-
-# Database
+# ডাটাবেস
 DB_FILE = f"instance_{INSTANCE_ID}.db"
 
-# ==================== LOGGING ====================
+# ==================== লগিং ====================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -121,7 +97,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("VPSBot")
 
-# ==================== DATABASE LAYER ====================
+# ==================== ডাটাবেস লেয়ার ====================
 
 def get_db():
     conn = sqlite3.connect(DB_FILE, timeout=10)
@@ -130,16 +106,6 @@ def get_db():
 
 def init_db():
     with get_db() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )
-        """)
-        conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('port_min', ?)", (str(PORT_MIN),))
-        conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('port_max', ?)", (str(PORT_MAX),))
-        conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('public_host', ?)", (PUBLIC_HOST,))
-
         conn.execute("""
             CREATE TABLE IF NOT EXISTS core_keys (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -157,15 +123,13 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 instance_uuid TEXT UNIQUE NOT NULL,
                 user_id INTEGER NOT NULL,
-                port INTEGER UNIQUE NOT NULL,
                 password TEXT NOT NULL,
                 directory TEXT NOT NULL,
-                pid INTEGER,
-                status TEXT DEFAULT 'stopped',
                 created_at INTEGER NOT NULL,
                 expires_at INTEGER NOT NULL,
                 core_key_id INTEGER,
-                renewed_from INTEGER
+                renewed_from INTEGER,
+                status TEXT DEFAULT 'active'
             )
         """)
         conn.execute("""
@@ -202,41 +166,7 @@ def init_db():
         conn.commit()
     logger.info("Database initialized")
 
-def get_setting(key, default=None):
-    with get_db() as conn:
-        row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
-        return row["value"] if row else default
-
-def set_setting(key, value):
-    with get_db() as conn:
-        conn.execute("REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
-        conn.commit()
-    set_key(ENV_FILE, key.upper(), str(value))
-
-def detect_public_ip():
-    if REQUESTS_AVAILABLE:
-        try:
-            ip = requests.get('https://api.ipify.org', timeout=5).text.strip()
-            if ip:
-                return ip
-        except:
-            pass
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except:
-        return "YOUR_PUBLIC_IP"
-
-def get_public_host():
-    host = get_setting("public_host", "")
-    if not host:
-        host = detect_public_ip()
-        set_setting("public_host", host)
-    return host
-
+# ---------- Core Keys ----------
 def generate_core_key(duration_days, max_servers, admin_id):
     key = "CORE-" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=12))
     with get_db() as conn:
@@ -270,18 +200,7 @@ def list_core_keys(active_only=True):
             rows = conn.execute("SELECT * FROM core_keys ORDER BY created_at DESC").fetchall()
     return [dict(r) for r in rows]
 
-def get_available_port():
-    port_min = int(get_setting("port_min", PORT_MIN))
-    port_max = int(get_setting("port_max", PORT_MAX))
-    used_ports = set()
-    with get_db() as conn:
-        used = conn.execute("SELECT port FROM instances").fetchall()
-        used_ports = {r["port"] for r in used}
-    for port in range(port_min, port_max + 1):
-        if port not in used_ports and is_port_available(port):
-            return port
-    raise RuntimeError(f"No free ports in range {port_min}-{port_max}")
-
+# ---------- Instances ----------
 def create_instance(user_id, core_key_id, duration_days, renewed_instance_id=None):
     if renewed_instance_id:
         with get_db() as conn:
@@ -290,15 +209,14 @@ def create_instance(user_id, core_key_id, duration_days, renewed_instance_id=Non
                 raise ValueError("Instance not found")
             new_expires = int((datetime.now() + timedelta(days=duration_days)).timestamp())
             conn.execute(
-                "UPDATE instances SET expires_at = ?, status = 'stopped', core_key_id = ? WHERE id = ?",
+                "UPDATE instances SET expires_at = ?, core_key_id = ? WHERE id = ?",
                 (new_expires, core_key_id, renewed_instance_id)
             )
             conn.commit()
-            return renewed_instance_id, inst["port"], inst["password"], inst["directory"]
+            return renewed_instance_id, inst["instance_uuid"], inst["password"], inst["directory"]
     else:
-        port = get_available_port()
         password = ''.join(random.choices(string.ascii_letters + string.digits, k=12))
-        instance_uuid = str(uuid.uuid4())[:12]
+        instance_uuid = str(uuid.uuid4())
         directory = f"instances/{instance_uuid}"
         os.makedirs(directory, exist_ok=True)
 
@@ -308,16 +226,16 @@ def create_instance(user_id, core_key_id, duration_days, renewed_instance_id=Non
         with get_db() as conn:
             conn.execute("""
                 INSERT INTO instances
-                (instance_uuid, user_id, port, password, directory, created_at, expires_at, core_key_id, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (instance_uuid, user_id, port, password, directory, created_at, expires_at, core_key_id, 'stopped'))
+                (instance_uuid, user_id, password, directory, created_at, expires_at, core_key_id, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (instance_uuid, user_id, password, directory, created_at, expires_at, core_key_id, 'active'))
             conn.commit()
             instance_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-        return instance_id, port, password, directory
+        return instance_id, instance_uuid, password, directory
 
-def get_instance(instance_id):
+def get_instance_by_uuid(instance_uuid):
     with get_db() as conn:
-        row = conn.execute("SELECT * FROM instances WHERE id = ?", (instance_id,)).fetchone()
+        row = conn.execute("SELECT * FROM instances WHERE instance_uuid = ?", (instance_uuid,)).fetchone()
     return dict(row) if row else None
 
 def get_user_instances(user_id, include_expired=False):
@@ -331,53 +249,43 @@ def get_user_instances(user_id, include_expired=False):
         rows = conn.execute(query, params).fetchall()
     return [dict(r) for r in rows]
 
-def get_all_instances(limit=100):
+def get_expired_instances_for_user(user_id):
+    now = int(time.time())
     with get_db() as conn:
-        rows = conn.execute("SELECT * FROM instances ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+        rows = conn.execute(
+            "SELECT * FROM instances WHERE user_id = ? AND expires_at <= ? ORDER BY created_at DESC",
+            (user_id, now)
+        ).fetchall()
     return [dict(r) for r in rows]
 
-def update_instance_status(instance_id, status, pid=None):
+def delete_instance_by_uuid(instance_uuid):
     with get_db() as conn:
-        if pid is not None:
-            conn.execute("UPDATE instances SET status = ?, pid = ? WHERE id = ?", (status, pid, instance_id))
-        else:
-            conn.execute("UPDATE instances SET status = ? WHERE id = ?", (status, instance_id))
-        conn.commit()
-
-def delete_instance(instance_id):
-    stop_file_server(instance_id)
-    with get_db() as conn:
-        row = conn.execute("SELECT directory FROM instances WHERE id = ?", (instance_id,)).fetchone()
+        row = conn.execute("SELECT directory FROM instances WHERE instance_uuid = ?", (instance_uuid,)).fetchone()
         if row:
             shutil.rmtree(row["directory"], ignore_errors=True)
-        conn.execute("DELETE FROM instances WHERE id = ?", (instance_id,))
+        conn.execute("DELETE FROM instances WHERE instance_uuid = ?", (instance_uuid,))
         conn.commit()
 
 def count_user_active_servers(user_id):
     with get_db() as conn:
         row = conn.execute(
-            "SELECT COUNT(*) as cnt FROM instances WHERE user_id = ? AND status = 'running' AND expires_at > ?",
+            "SELECT COUNT(*) as cnt FROM instances WHERE user_id = ? AND expires_at > ?",
             (user_id, int(time.time()))
         ).fetchone()
     return row["cnt"] if row else 0
 
-def get_expired_instances_for_user(user_id):
-    now = int(time.time())
-    with get_db() as conn:
-        rows = conn.execute(
-            "SELECT * FROM instances WHERE user_id = ? AND expires_at <= ? AND status != 'running' ORDER BY created_at DESC",
-            (user_id, now)
-        ).fetchall()
-    return [dict(r) for r in rows]
+# ---------- File Logging ----------
+def log_file_upload(instance_uuid, filename, filepath, size):
+    inst = get_instance_by_uuid(instance_uuid)
+    if inst:
+        with get_db() as conn:
+            conn.execute(
+                "INSERT INTO files (instance_id, filename, filepath, size, uploaded_at) VALUES (?, ?, ?, ?, ?)",
+                (inst["id"], filename, filepath, size, int(time.time()))
+            )
+            conn.commit()
 
-def log_file_upload(instance_id, filename, filepath, size):
-    with get_db() as conn:
-        conn.execute(
-            "INSERT INTO files (instance_id, filename, filepath, size, uploaded_at) VALUES (?, ?, ?, ?, ?)",
-            (instance_id, filename, filepath, size, int(time.time()))
-        )
-        conn.commit()
-
+# ---------- Users ----------
 def update_user(user_id, first_name, username):
     with get_db() as conn:
         now = int(time.time())
@@ -404,8 +312,6 @@ def block_user(user_id):
     with get_db() as conn:
         conn.execute("UPDATE users SET blocked = 1 WHERE user_id = ?", (user_id,))
         conn.commit()
-    for inst in get_user_instances(user_id, include_expired=False):
-        stop_file_server(inst["id"])
 
 def unblock_user(user_id):
     with get_db() as conn:
@@ -417,6 +323,7 @@ def get_all_users(limit=100):
         rows = conn.execute("SELECT * FROM users ORDER BY last_interaction DESC LIMIT ?", (limit,)).fetchall()
     return [dict(r) for r in rows]
 
+# ---------- Logging ----------
 def log_action(action, user_id=None, details=None):
     with get_db() as conn:
         conn.execute(
@@ -425,176 +332,141 @@ def log_action(action, user_id=None, details=None):
         )
         conn.commit()
 
+# ---------- Statistics ----------
 def get_stats():
     with get_db() as conn:
         total_keys = conn.execute("SELECT COUNT(*) FROM core_keys").fetchone()[0]
         active_keys = conn.execute("SELECT COUNT(*) FROM core_keys WHERE is_active=1").fetchone()[0]
         total_instances = conn.execute("SELECT COUNT(*) FROM instances").fetchone()[0]
-        running_instances = conn.execute("SELECT COUNT(*) FROM instances WHERE status='running'").fetchone()[0]
+        active_instances = conn.execute("SELECT COUNT(*) FROM instances WHERE expires_at > ?", (int(time.time()),)).fetchone()[0]
         expired_instances = conn.execute("SELECT COUNT(*) FROM instances WHERE expires_at <= ?", (int(time.time()),)).fetchone()[0]
         total_users = conn.execute("SELECT COUNT(DISTINCT user_id) FROM users").fetchone()[0]
         blocked_users = conn.execute("SELECT COUNT(*) FROM users WHERE blocked=1").fetchone()[0]
         total_files = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
-    stats = {
+    return {
         "total_keys": total_keys,
         "active_keys": active_keys,
         "total_instances": total_instances,
-        "running_instances": running_instances,
+        "active_instances": active_instances,
         "expired_instances": expired_instances,
         "total_users": total_users,
         "blocked_users": blocked_users,
         "total_files": total_files,
     }
-    if PSUTIL_AVAILABLE:
-        stats["cpu"] = psutil.cpu_percent()
-        stats["ram"] = psutil.virtual_memory().percent
-        stats["disk"] = psutil.disk_usage('/').percent
-    return stats
 
-def is_port_available(port):
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        try:
-            s.bind(("0.0.0.0", port))
-            return True
-        except socket.error:
-            return False
+# ==================== Flask অ্যাপ ====================
 
-def is_owner(user_id):
-    return user_id == OWNER_ID
+app = Flask(__name__)
+app.secret_key = INSTANCE_SECRET
 
-# ==================== FILE SERVER WITH CUSTOM LOGIN ====================
+# ---------- লগইন পেজ (HTML) ----------
+LOGIN_PAGE_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VPS Login - Bangladesh Edition</title>
+    <style>
+        * { margin:0; padding:0; box-sizing:border-box; font-family:'Segoe UI',sans-serif; }
+        body { background:linear-gradient(135deg,#667eea 0%,#764ba2 100%); height:100vh; display:flex; justify-content:center; align-items:center; }
+        .login-container { background:white; border-radius:10px; box-shadow:0 14px 28px rgba(0,0,0,0.25),0 10px 10px rgba(0,0,0,0.22); width:400px; padding:40px; }
+        h2 { text-align:center; color:#333; margin-bottom:30px; font-weight:500; }
+        .flag { text-align:center; margin-bottom:20px; font-size:48px; }
+        .input-group { margin-bottom:20px; }
+        label { display:block; margin-bottom:8px; color:#555; font-size:14px; }
+        input[type="password"] { width:100%; padding:12px 15px; border:1px solid #ddd; border-radius:5px; font-size:16px; transition:0.3s; }
+        input[type="password"]:focus { border-color:#667eea; outline:none; box-shadow:0 0 8px rgba(102,126,234,0.3); }
+        button { width:100%; padding:12px; background:linear-gradient(135deg,#667eea 0%,#764ba2 100%); border:none; border-radius:5px; color:white; font-size:16px; font-weight:600; cursor:pointer; transition:0.3s; }
+        button:hover { transform:translateY(-2px); box-shadow:0 5px 15px rgba(0,0,0,0.2); }
+        .info { margin-top:20px; text-align:center; font-size:14px; color:#777; }
+    </style>
+</head>
+<body>
+    <div class="login-container">
+        <div class="flag">🇧🇩</div>
+        <h2>VPS File Server Login</h2>
+        <form method="post">
+            <div class="input-group">
+                <label for="password">🔑 Password</label>
+                <input type="password" id="password" name="password" placeholder="Enter your VPS password" required autofocus>
+            </div>
+            <button type="submit">Login</button>
+        </form>
+        <div class="info">
+            <p>Secure file server provided by<br><strong>Telegram VPS Bot – Bangladesh Edition</strong></p>
+        </div>
+    </div>
+</body>
+</html>"""
 
-class FileServerHandler(SimpleHTTPRequestHandler):
-    def __init__(self, *args, directory=None, password=None, instance_id=None, **kwargs):
-        self.server_password = password
-        self.instance_id = instance_id
-        self.login_page_path = LOGIN_PAGE
-        super().__init__(*args, directory=directory, **kwargs)
+# ---------- ভিপিএস ফাইল ম্যানেজার রুট ----------
+@app.route('/vps/<instance_uuid>/', methods=['GET', 'POST'])
+@app.route('/vps/<instance_uuid>', methods=['GET', 'POST'])
+def vps_root(instance_uuid):
+    # ইন্সট্যান্স চেক
+    inst = get_instance_by_uuid(instance_uuid)
+    if not inst:
+        return "VPS not found", 404
+    if inst['expires_at'] < int(time.time()):
+        return "<h2>This VPS has expired.</h2><p>Renew with a new Core Key via Telegram.</p>", 410
 
-    def parse_cookies(self):
-        cookie_header = self.headers.get('Cookie')
-        if cookie_header:
-            cookie = SimpleCookie()
-            cookie.load(cookie_header)
-            return cookie
-        return None
-
-    def is_authenticated(self):
-        cookie = self.parse_cookies()
-        if cookie and 'vps_auth' in cookie:
-            token = cookie['vps_auth'].value
-            expected = hashlib.sha256(self.server_password.encode()).hexdigest()
-            return hmac.compare_digest(token, expected)
-        return False
-
-    def send_login_page(self):
-        self.send_response(200)
-        self.send_header('Content-Type', 'text/html; charset=utf-8')
-        self.end_headers()
-        try:
-            with open(self.login_page_path, 'r', encoding='utf-8') as f:
-                login_html = f.read()
-            login_html = login_html.replace('{{port}}', str(self.server.server_address[1]))
-            self.wfile.write(login_html.encode('utf-8'))
-        except FileNotFoundError:
-            self.wfile.write(b'''
-            <!DOCTYPE html>
-            <html><head><title>Login</title></head>
-            <body><h2>VPS Login</h2>
-                <form method="post" action="/login">
-                    <label>Password:</label>
-                    <input type="password" name="password">
-                    <button type="submit">Login</button>
-                </form>
-            </body></html>
-            ''')
-
-    def do_GET(self):
-        if self.path == '/logout':
-            self.send_response(303)
-            self.send_header('Location', '/')
-            self.send_header('Set-Cookie', 'vps_auth=; Path=/; Max-Age=0')
-            self.end_headers()
-            return
-        if not self.is_authenticated():
-            self.send_login_page()
-            return
-        path = self.translate_path(self.path)
-        if os.path.isdir(path):
-            self.serve_directory(path)
-        else:
-            super().do_GET()
-
-    def do_POST(self):
-        if self.path == '/login':
-            content_length = int(self.headers.get('Content-Length', 0))
-            post_data = self.rfile.read(content_length).decode('utf-8')
-            params = parse_qs(post_data)
-            password = params.get('password', [''])[0]
-            if password == self.server_password:
-                token = hashlib.sha256(self.server_password.encode()).hexdigest()
-                self.send_response(303)
-                self.send_header('Location', '/')
-                self.send_header('Set-Cookie', f'vps_auth={token}; Path=/; HttpOnly')
-                self.end_headers()
+    # অথেনটিকেশন চেক (সেশন)
+    if not session.get(f'vps_auth_{instance_uuid}'):
+        if request.method == 'POST':
+            password = request.form.get('password')
+            if password == inst['password']:
+                session[f'vps_auth_{instance_uuid}'] = True
+                return redirect(request.url)
             else:
-                self.send_response(401)
-                self.send_header('Content-Type', 'text/html')
-                self.end_headers()
-                self.wfile.write(b'<h2>Invalid password</h2><a href="/">Try again</a>')
-            return
-        if not self.is_authenticated():
-            self.send_login_page()
-            return
-        content_type = self.headers.get('Content-Type', '')
-        if 'multipart/form-data' in content_type:
-            import cgi
-            form = cgi.FieldStorage(
-                fp=self.rfile,
-                headers=self.headers,
-                environ={'REQUEST_METHOD': 'POST'}
-            )
-            file_item = form.getfirst('file')
-            if file_item and file_item.filename:
-                filename = os.path.basename(file_item.filename)
-                filepath = os.path.join(self.directory, filename)
-                with open(filepath, 'wb') as f:
-                    f.write(file_item.file.read())
+                return LOGIN_PAGE_HTML.replace('<form method="post">', '<form method="post"><p style="color:red;">Invalid password</p>')
+        return LOGIN_PAGE_HTML
+
+    # অথেনটিকেটেড – ফাইল তালিকা দেখাও
+    directory = inst['directory']
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+
+    if request.method == 'POST':
+        # ফাইল আপলোড
+        if 'file' in request.files:
+            file = request.files['file']
+            if file and file.filename:
+                filename = os.path.basename(file.filename)
+                filepath = os.path.join(directory, filename)
+                file.save(filepath)
                 size = os.path.getsize(filepath)
-                log_file_upload(self.instance_id, filename, filepath, size)
-                self.send_response(303)
-                self.send_header('Location', '/')
-                self.end_headers()
-                return
-            delete_file = form.getfirst('delete')
-            if delete_file:
-                filepath = os.path.join(self.directory, delete_file)
-                if os.path.exists(filepath) and os.path.isfile(filepath):
-                    os.remove(filepath)
-                    self.send_response(303)
-                    self.send_header('Location', '/')
-                    self.end_headers()
-                return
-        self.send_response(400)
-        self.end_headers()
-        self.wfile.write(b'Bad request')
+                log_file_upload(instance_uuid, filename, filepath, size)
+                return redirect(request.url)
+        # ফাইল ডিলিট
+        delete_file = request.form.get('delete')
+        if delete_file:
+            filepath = os.path.join(directory, delete_file)
+            if os.path.exists(filepath) and os.path.isfile(filepath):
+                os.remove(filepath)
+            return redirect(request.url)
 
-    def serve_directory(self, path):
-        try:
-            list = os.listdir(path)
-        except OSError:
-            self.send_error(404, "No permission")
-            return
-        list.sort(key=lambda a: a.lower())
-        public_host = get_public_host()
-        port = self.server.server_address[1]
+    # ফাইল তালিকা জেনারেট
+    files = []
+    if os.path.exists(directory):
+        for f in os.listdir(directory):
+            fullpath = os.path.join(directory, f)
+            if os.path.isfile(fullpath):
+                size = os.path.getsize(fullpath)
+                files.append({
+                    'name': f,
+                    'size': size,
+                    'size_str': f"{size} B" if size < 1024 else f"{size/1024:.1f} KB" if size < 1024*1024 else f"{size/(1024*1024):.1f} MB"
+                })
+    files.sort(key=lambda x: x['name'].lower())
 
-        html_content = f"""<!DOCTYPE html>
+    # HTML তৈরি
+    base_url = PUBLIC_URL or request.host_url.rstrip('/')
+    html = f"""<!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>VPS File Manager - Port {port}</title>
+    <title>VPS File Manager</title>
     <style>
         body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f5f7fa; margin: 0; padding: 20px; color: #333; }}
         .container {{ max-width: 1200px; margin: auto; background: white; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); padding: 30px; }}
@@ -615,51 +487,41 @@ class FileServerHandler(SimpleHTTPRequestHandler):
 </head>
 <body>
     <div class="container">
-        <h1>📁 VPS File Server <a href="/logout" class="btn btn-danger logout">Logout</a></h1>
+        <h1>📁 VPS File Server 
+            <a href="{url_for('vps_logout', instance_uuid=instance_uuid)}" class="btn btn-danger logout">Logout</a>
+        </h1>
         <div class="info">
-            <strong>Public URL:</strong> http://{public_host}:{port}<br>
+            <strong>Access URL:</strong> <code>{base_url}/vps/{instance_uuid}/</code><br>
+            <strong>Expires:</strong> {datetime.fromtimestamp(inst['expires_at']).strftime('%Y-%m-%d %H:%M')}
         </div>
         <div class="upload-form">
             <h3>📤 Upload File</h3>
-            <form action="/" method="post" enctype="multipart/form-data">
+            <form method="post" enctype="multipart/form-data">
                 <input type="file" name="file" required>
                 <button type="submit" class="btn">Upload</button>
             </form>
         </div>
-        <h3>📄 Files in this VPS</h3>
+        <h3>📄 Files</h3>
         <table>
             <tr>
                 <th>Filename</th>
                 <th>Size</th>
                 <th>Actions</th>
-            </tr>
-        """
-        for name in list:
-            fullname = os.path.join(path, name)
-            displayname = linkname = name
-            if os.path.isdir(fullname):
-                displayname = name + "/"
-                linkname = name + "/"
-            size = os.path.getsize(fullname) if os.path.isfile(fullname) else 0
-            size_str = f"{size} B"
-            if size >= 1024:
-                size_str = f"{size/1024:.1f} KB"
-            if size >= 1024*1024:
-                size_str = f"{size/(1024*1024):.1f} MB"
-            html_content += f"""
+            </tr>"""
+    for f in files:
+        html += f"""
             <tr>
-                <td><a href="{linkname}">{html.escape(displayname)}</a></td>
-                <td>{size_str}</td>
+                <td><a href="{url_for('vps_download', instance_uuid=instance_uuid, filename=f['name'])}">{html.escape(f['name'])}</a></td>
+                <td>{f['size_str']}</td>
                 <td>
-                    <a href="{linkname}" class="btn" download>Download</a>
-                    <form action="/" method="post" style="display:inline;">
-                        <input type="hidden" name="delete" value="{name}">
-                        <button type="submit" class="btn btn-danger" onclick="return confirm('Delete {name}?')">Delete</button>
+                    <a href="{url_for('vps_download', instance_uuid=instance_uuid, filename=f['name'])}" class="btn" download>Download</a>
+                    <form method="post" style="display:inline;">
+                        <input type="hidden" name="delete" value="{f['name']}">
+                        <button type="submit" class="btn btn-danger" onclick="return confirm('Delete {f['name']}?')">Delete</button>
                     </form>
                 </td>
-            </tr>
-            """
-        html_content += """
+            </tr>"""
+    html += """
         </table>
         <div class="footer">
             Powered by Telegram VPS Bot – Bangladesh Edition
@@ -667,110 +529,52 @@ class FileServerHandler(SimpleHTTPRequestHandler):
     </div>
 </body>
 </html>"""
-        self.send_response(200)
-        self.send_header('Content-Type', 'text/html; charset=utf-8')
-        self.end_headers()
-        self.wfile.write(html_content.encode('utf-8'))
+    return html
 
-    def log_message(self, format, *args):
-        pass
+@app.route('/vps/<instance_uuid>/logout')
+def vps_logout(instance_uuid):
+    session.pop(f'vps_auth_{instance_uuid}', None)
+    return redirect(url_for('vps_root', instance_uuid=instance_uuid))
 
-def run_file_server(port, password, directory, instance_id):
-    server_address = ('0.0.0.0', port)
-    handler = lambda *args, **kwargs: FileServerHandler(
-        *args, directory=directory, password=password, instance_id=instance_id, **kwargs
-    )
-    httpd = HTTPServer(server_address, handler)
-    logger.info(f"File server started on port {port} (public)")
-    httpd.serve_forever()
+@app.route('/vps/<instance_uuid>/download/<path:filename>')
+def vps_download(instance_uuid, filename):
+    inst = get_instance_by_uuid(instance_uuid)
+    if not inst or not session.get(f'vps_auth_{instance_uuid}'):
+        return redirect(url_for('vps_root', instance_uuid=instance_uuid))
+    directory = inst['directory']
+    return send_from_directory(directory, filename, as_attachment=True)
 
-def start_file_server(instance_id):
-    inst = get_instance(instance_id)
-    if not inst:
-        return False, "Instance not found"
-    if is_user_blocked(inst["user_id"]):
-        return False, "Your account is blocked. Contact admin."
-    if inst['status'] == 'running':
-        return False, "Already running"
-    if not os.path.exists(inst['directory']):
-        os.makedirs(inst['directory'], exist_ok=True)
-
-    proc = subprocess.Popen(
-        [sys.executable, '-c',
-         f"import sys; sys.path.append('.'); from main import run_file_server; run_file_server({inst['port']}, '{inst['password']}', '{inst['directory']}', {instance_id})"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
-    )
-    time.sleep(0.5)
-    if proc.poll() is None:
-        update_instance_status(instance_id, 'running', proc.pid)
-        log_action("start_instance", inst['user_id'], f"instance={instance_id}")
-        public_host = get_public_host()
-        return True, f"Server started on http://{public_host}:{inst['port']}"
-    else:
-        return False, "Failed to start server"
-
-def stop_file_server(instance_id):
-    inst = get_instance(instance_id)
-    if not inst:
-        return False, "Instance not found"
-    if inst['status'] != 'running' or not inst['pid']:
-        update_instance_status(instance_id, 'stopped')
-        return True, "Already stopped"
-    try:
-        os.kill(inst['pid'], signal.SIGTERM)
-        time.sleep(0.3)
-        update_instance_status(instance_id, 'stopped', None)
-        log_action("stop_instance", inst['user_id'], f"instance={instance_id}")
-        return True, "Server stopped"
-    except ProcessLookupError:
-        update_instance_status(instance_id, 'stopped', None)
-        return True, "Server process not found, marked stopped"
-    except Exception as e:
-        return False, f"Error: {e}"
-
-def restart_file_server(instance_id):
-    stop_file_server(instance_id)
-    time.sleep(0.5)
-    return start_file_server(instance_id)
-
-# ==================== BACKGROUND EXPIRY CHECKER ====================
-
-def expiry_checker():
-    while True:
-        try:
-            now = int(time.time())
-            with get_db() as conn:
-                expired = conn.execute(
-                    "SELECT * FROM instances WHERE expires_at <= ? AND status = 'running'",
-                    (now,)
-                ).fetchall()
-                for inst in expired:
-                    stop_file_server(inst['id'])
-                    try:
-                        bot.send_message(
-                            inst['user_id'],
-                            f"⚠️ Your VPS (port {inst['port']}) has expired and has been stopped.\n"
-                            "You can renew it with a new Core Key."
-                        )
-                    except:
-                        pass
-                    log_action("auto_expire", inst['user_id'], f"instance={inst['id']}")
-        except Exception as e:
-            logger.error(f"Expiry checker error: {e}")
-        time.sleep(60)
-
-# ==================== TELEGRAM BOT (WEBHOOK MODE) ====================
-
+# ---------- টেলিগ্রাম ওয়েবহুক ----------
 bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    if request.headers.get('content-type') == 'application/json':
+        json_string = request.get_data().decode('utf-8')
+        update = Update.de_json(json_string)
+        bot.process_new_updates([update])
+        return '', 200
+    return '', 403
+
+def set_webhook():
+    if not PUBLIC_URL:
+        logger.error("PUBLIC_URL not set. Cannot set webhook.")
+        return False
+    webhook_url = f"{PUBLIC_URL}/webhook"
+    bot.remove_webhook()
+    time.sleep(0.5)
+    bot.set_webhook(url=webhook_url)
+    logger.info(f"Webhook set to {webhook_url}")
+    return True
+
+# ---------- টেলিগ্রাম হ্যান্ডলার ----------
 def main_menu(user_id):
     markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     markup.add(
         KeyboardButton("🖥 My VPS"),
         KeyboardButton("🔑 Redeem Key")
     )
-    if is_owner(user_id):
+    if user_id == OWNER_ID:
         markup.add(KeyboardButton("⚙️ Admin Panel"))
     markup.add(KeyboardButton("📞 Help"))
     return markup
@@ -782,7 +586,6 @@ def admin_menu():
         KeyboardButton("🗝 List Keys"),
         KeyboardButton("📋 All Instances"),
         KeyboardButton("👥 User Management"),
-        KeyboardButton("🔧 Settings"),
         KeyboardButton("📊 Detailed Stats"),
         KeyboardButton("🔙 Back")
     )
@@ -800,11 +603,11 @@ def start_cmd(message):
         bot.send_message(message.chat.id, "❌ Your account is blocked. Contact admin.")
         return
     update_user(user_id, message.from_user.first_name, message.from_user.username)
-    public_host = get_public_host()
     bot.send_message(
         message.chat.id,
-        f"🚀 Welcome to **Public VPS Bot** (Instance: {INSTANCE_ID})\n"
-        f"🌍 Your servers will be accessible at: `http://{public_host}:PORT`\n\n"
+        f"🚀 Welcome to **VPS Bot** (Instance: {INSTANCE_ID})\n"
+        f"🌍 Your VPS will be accessible at:\n"
+        f"`{PUBLIC_URL or 'https://your-domain.com'}/vps/<UUID>/`\n\n"
         "Redeem a Core Key to get your own private file server.\n"
         "Use the menu below.",
         reply_markup=main_menu(user_id),
@@ -823,14 +626,14 @@ def help_handler(message):
         "📘 **How to use**\n\n"
         "• **Redeem Key** – Enter a Core Key to create or renew a VPS.\n"
         "• **My VPS** – View and manage your active servers.\n"
-        "• Each VPS is a **public file server** with password protection.\n"
-        "• **Access URL**: `http://<server-ip>:<port>` (shown in bot).\n"
-        "• **Login**: Use the password on the custom login page.\n"
-        "• Upload/download/delete files via beautiful web interface.\n"
+        "• Each VPS is a **private file server** protected by password.\n"
+        "• **Access URL**: `{PUBLIC_URL}/vps/<UUID>/`\n"
+        "• **Login**: Use the password on the login page.\n"
+        "• Upload/download/delete files via web interface.\n"
         "• Servers auto‑expire after the key's duration.\n"
         "• **Renewal**: If you have an expired server, redeeming a key will ask if you want to renew it.\n\n"
         "Admin commands are shown if you are the owner."
-    )
+    ).format(PUBLIC_URL=PUBLIC_URL or 'https://your-domain.com')
     bot.send_message(message.chat.id, text, parse_mode="Markdown")
 
 @bot.message_handler(func=lambda m: m.text == "🔑 Redeem Key")
@@ -855,101 +658,88 @@ def process_redeem(message):
     if not core_key:
         bot.send_message(message.chat.id, "❌ Invalid or expired Core Key.", reply_markup=main_menu(user_id))
         return
-    expired_instances = get_expired_instances_for_user(user_id)
-    if expired_instances:
+    expired = get_expired_instances_for_user(user_id)
+    if expired:
         markup = InlineKeyboardMarkup()
-        for inst in expired_instances[:5]:
+        for inst in expired[:5]:
             expires = datetime.fromtimestamp(inst['expires_at']).strftime("%Y-%m-%d")
-            btn_text = f"Renew port {inst['port']} (expired {expires})"
-            markup.add(InlineKeyboardButton(btn_text, callback_data=f"renew:{inst['id']}:{key_str}"))
+            btn_text = f"Renew VPS ({inst['instance_uuid'][:8]} expired {expires})"
+            markup.add(InlineKeyboardButton(btn_text, callback_data=f"renew:{inst['instance_uuid']}:{key_str}"))
         markup.add(InlineKeyboardButton("➕ Create New Server", callback_data=f"new:{key_str}"))
         markup.add(InlineKeyboardButton("❌ Cancel", callback_data="cancel_renew"))
         bot.send_message(
             message.chat.id,
-            "You have expired servers. Choose one to renew, or create a new one:",
+            "You have expired VPS. Choose one to renew, or create a new one:",
             reply_markup=markup
         )
         return
-    create_new_server(user_id, core_key, message.chat.id)
+    create_new_vps(user_id, core_key, message.chat.id)
 
-def create_new_server(user_id, core_key, chat_id):
+def create_new_vps(user_id, core_key, chat_id):
     if is_user_blocked(user_id):
         bot.send_message(chat_id, "❌ Blocked.", reply_markup=main_menu(user_id))
         return
-    active_count = count_user_active_servers(user_id)
-    if active_count >= core_key['max_servers']:
+    active = count_user_active_servers(user_id)
+    if active >= core_key['max_servers']:
         bot.send_message(
             chat_id,
-            f"❌ You already have {active_count} active server(s). "
-            f"This key allows max {core_key['max_servers']}.",
+            f"❌ You already have {active} active server(s). This key allows max {core_key['max_servers']}.",
             reply_markup=main_menu(user_id)
         )
         return
     try:
-        instance_id, port, password, directory = create_instance(
+        instance_id, instance_uuid, password, directory = create_instance(
             user_id, core_key['id'], core_key['duration_days']
         )
         increment_key_usage(core_key['id'])
-        success, msg_text = start_file_server(instance_id)
-        if success:
-            public_host = get_public_host()
-            bot.send_message(
-                chat_id,
-                f"✅ **VPS Created Successfully!**\n\n"
-                f"🌍 **Public URL:** `http://{public_host}:{port}`\n"
-                f"🔑 **Password:** `{password}`\n"
-                f"📁 **Root Directory:** `{directory}`\n"
-                f"⏳ **Expires:** {datetime.fromtimestamp(int(time.time()) + core_key['duration_days']*86400).strftime('%Y-%m-%d %H:%M')}\n\n"
-                f"Use the password to login via browser.",
-                parse_mode="Markdown",
-                reply_markup=main_menu(user_id)
-            )
-            log_action("redeem_key_new", user_id, f"key={core_key['key']}, instance={instance_id}")
-        else:
-            bot.send_message(chat_id, f"❌ Server created but failed to start: {msg_text}", reply_markup=main_menu(user_id))
+        bot.send_message(
+            chat_id,
+            f"✅ **VPS Created Successfully!**\n\n"
+            f"🌍 **Public URL:** `{PUBLIC_URL}/vps/{instance_uuid}/`\n"
+            f"🔑 **Password:** `{password}`\n"
+            f"📁 **Root Directory:** `{directory}`\n"
+            f"⏳ **Expires:** {datetime.fromtimestamp(int(time.time()) + core_key['duration_days']*86400).strftime('%Y-%m-%d %H:%M')}\n\n"
+            f"Use the password to login via browser.",
+            parse_mode="Markdown",
+            reply_markup=main_menu(user_id)
+        )
+        log_action("redeem_key_new", user_id, f"key={core_key['key']}, instance={instance_uuid}")
     except Exception as e:
         bot.send_message(chat_id, f"❌ Error creating VPS: {e}", reply_markup=main_menu(user_id))
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("renew:"))
-def renew_instance_cb(call):
-    _, instance_id, key_str = call.data.split(":", 2)
-    instance_id = int(instance_id)
+def renew_callback(call):
+    _, instance_uuid, key_str = call.data.split(":", 2)
     user_id = call.from_user.id
     core_key = get_core_key(key_str)
     if not core_key:
-        bot.answer_callback_query(call.id, "Key invalid or expired.", show_alert=True)
+        bot.answer_callback_query(call.id, "Key invalid.", show_alert=True)
         return
-    inst = get_instance(instance_id)
+    inst = get_instance_by_uuid(instance_uuid)
     if not inst or inst['user_id'] != user_id:
         bot.answer_callback_query(call.id, "Not your instance.", show_alert=True)
         return
     try:
-        instance_id, port, password, directory = create_instance(
-            user_id, core_key['id'], core_key['duration_days'], renewed_instance_id=instance_id
+        instance_id, _, password, directory = create_instance(
+            user_id, core_key['id'], core_key['duration_days'], renewed_instance_id=inst['id']
         )
         increment_key_usage(core_key['id'])
-        success, msg_text = start_file_server(instance_id)
-        if success:
-            public_host = get_public_host()
-            bot.edit_message_text(
-                f"✅ **VPS Renewed Successfully!**\n\n"
-                f"🌍 **Public URL:** `http://{public_host}:{port}`\n"
-                f"🔑 **Password:** `{password}` (unchanged)\n"
-                f"⏳ **New Expiry:** {datetime.fromtimestamp(inst['expires_at']).strftime('%Y-%m-%d %H:%M')}\n\n"
-                f"The server has been restarted.",
-                call.message.chat.id,
-                call.message.message_id,
-                parse_mode="Markdown"
-            )
-            log_action("renew_instance", user_id, f"key={core_key['key']}, instance={instance_id}")
-        else:
-            bot.edit_message_text(f"❌ Renewal failed: {msg_text}", call.message.chat.id, call.message.message_id)
+        bot.edit_message_text(
+            f"✅ **VPS Renewed Successfully!**\n\n"
+            f"🌍 **Public URL:** `{PUBLIC_URL}/vps/{instance_uuid}/`\n"
+            f"🔑 **Password:** `{password}` (unchanged)\n"
+            f"⏳ **New Expiry:** {datetime.fromtimestamp(inst['expires_at']).strftime('%Y-%m-%d %H:%M')}",
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown"
+        )
+        log_action("renew_instance", user_id, f"key={core_key['key']}, instance={instance_uuid}")
     except Exception as e:
         bot.edit_message_text(f"❌ Error: {e}", call.message.chat.id, call.message.message_id)
     bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("new:"))
-def new_instance_cb(call):
+def new_callback(call):
     _, key_str = call.data.split(":")
     user_id = call.from_user.id
     core_key = get_core_key(key_str)
@@ -957,11 +747,11 @@ def new_instance_cb(call):
         bot.answer_callback_query(call.id, "Key invalid.", show_alert=True)
         return
     bot.delete_message(call.message.chat.id, call.message.message_id)
-    create_new_server(user_id, core_key, call.message.chat.id)
+    create_new_vps(user_id, core_key, call.message.chat.id)
     bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data == "cancel_renew")
-def cancel_renew_cb(call):
+def cancel_renew(call):
     bot.edit_message_text("Cancelled.", call.message.chat.id, call.message.message_id)
     bot.answer_callback_query(call.id)
 
@@ -977,48 +767,33 @@ def my_vps(message):
         return
     markup = InlineKeyboardMarkup()
     for inst in instances:
-        status = "🟢" if inst['status'] == 'running' else "🔴"
         expires = datetime.fromtimestamp(inst['expires_at']).strftime("%m-%d %H:%M")
-        btn_text = f"{status} Port {inst['port']} (exp {expires})"
-        markup.add(InlineKeyboardButton(btn_text, callback_data=f"manage:{inst['id']}"))
+        btn_text = f"VPS {inst['instance_uuid'][:8]} (exp {expires})"
+        markup.add(InlineKeyboardButton(btn_text, callback_data=f"vps_info:{inst['instance_uuid']}"))
     bot.send_message(message.chat.id, "Your VPS instances:", reply_markup=markup)
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("manage:"))
-def manage_instance(call):
-    instance_id = int(call.data.split(":")[1])
-    inst = get_instance(instance_id)
+@bot.callback_query_handler(func=lambda call: call.data.startswith("vps_info:"))
+def vps_info(call):
+    instance_uuid = call.data.split(":", 1)[1]
+    inst = get_instance_by_uuid(instance_uuid)
     if not inst:
         bot.answer_callback_query(call.id, "Instance not found.")
         return
     user_id = call.from_user.id
-    if inst['user_id'] != user_id and not is_owner(user_id):
+    if inst['user_id'] != user_id and user_id != OWNER_ID:
         bot.answer_callback_query(call.id, "Access denied.")
         return
-    expires_str = datetime.fromtimestamp(inst['expires_at']).strftime("%Y-%m-%d %H:%M")
-    public_host = get_public_host()
+    expires = datetime.fromtimestamp(inst['expires_at']).strftime("%Y-%m-%d %H:%M")
     text = (
         f"**VPS Details**\n"
-        f"🌍 URL: `http://{public_host}:{inst['port']}`\n"
+        f"🌍 URL: `{PUBLIC_URL}/vps/{instance_uuid}/`\n"
         f"🔑 Password: `{inst['password']}`\n"
-        f"Status: {'🟢 Running' if inst['status'] == 'running' else '🔴 Stopped'}\n"
-        f"⏳ Expires: {expires_str}\n"
-        f"📁 Directory: `{inst['directory']}`\n"
+        f"⏳ Expires: {expires}\n"
     )
-    markup = InlineKeyboardMarkup(row_width=2)
-    if inst['status'] == 'running':
-        markup.add(
-            InlineKeyboardButton("🛑 Stop", callback_data=f"stop:{instance_id}"),
-            InlineKeyboardButton("🔄 Restart", callback_data=f"restart:{instance_id}")
-        )
-    else:
-        if inst['expires_at'] > int(time.time()):
-            markup.add(InlineKeyboardButton("▶️ Start", callback_data=f"start:{instance_id}"))
-        else:
-            text += "\n⚠️ This server has expired. Use a new Core Key to renew it."
-    markup.add(InlineKeyboardButton("🔗 Access Link", callback_data=f"link:{instance_id}"))
-    if is_owner(user_id) or inst['user_id'] == user_id:
-        markup.add(InlineKeyboardButton("🗑 Delete", callback_data=f"delete:{instance_id}"))
-    markup.add(InlineKeyboardButton("🔙 Back to list", callback_data="back_to_myvps"))
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("🔗 Open VPS", url=f"{PUBLIC_URL}/vps/{instance_uuid}/"))
+    markup.add(InlineKeyboardButton("🗑 Delete", callback_data=f"delete_vps:{instance_uuid}"))
+    markup.add(InlineKeyboardButton("🔙 Back", callback_data="back_to_myvps"))
     bot.edit_message_text(
         text,
         call.message.chat.id,
@@ -1028,71 +803,18 @@ def manage_instance(call):
     )
     bot.answer_callback_query(call.id)
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("start:"))
-def start_instance_cb(call):
-    instance_id = int(call.data.split(":")[1])
-    inst = get_instance(instance_id)
-    if inst['user_id'] != call.from_user.id and not is_owner(call.from_user.id):
-        bot.answer_callback_query(call.id, "Not allowed.")
-        return
-    success, msg = start_file_server(instance_id)
-    bot.answer_callback_query(call.id, msg, show_alert=True)
-    if success:
-        manage_instance(call)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("stop:"))
-def stop_instance_cb(call):
-    instance_id = int(call.data.split(":")[1])
-    inst = get_instance(instance_id)
-    if inst['user_id'] != call.from_user.id and not is_owner(call.from_user.id):
-        bot.answer_callback_query(call.id, "Not allowed.")
-        return
-    success, msg = stop_file_server(instance_id)
-    bot.answer_callback_query(call.id, msg, show_alert=True)
-    if success:
-        manage_instance(call)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("restart:"))
-def restart_instance_cb(call):
-    instance_id = int(call.data.split(":")[1])
-    inst = get_instance(instance_id)
-    if inst['user_id'] != call.from_user.id and not is_owner(call.from_user.id):
-        bot.answer_callback_query(call.id, "Not allowed.")
-        return
-    success, msg = restart_file_server(instance_id)
-    bot.answer_callback_query(call.id, msg, show_alert=True)
-    if success:
-        manage_instance(call)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("link:"))
-def link_instance_cb(call):
-    instance_id = int(call.data.split(":")[1])
-    inst = get_instance(instance_id)
+@bot.callback_query_handler(func=lambda call: call.data.startswith("delete_vps:"))
+def delete_vps_callback(call):
+    instance_uuid = call.data.split(":", 1)[1]
+    inst = get_instance_by_uuid(instance_uuid)
     if not inst:
         bot.answer_callback_query(call.id, "Not found.")
         return
-    public_host = get_public_host()
-    text = f"🔗 **Access your VPS**\n\nURL: `http://{public_host}:{inst['port']}`\nPassword: `{inst['password']}`"
-    bot.edit_message_text(
-        text,
-        call.message.chat.id,
-        call.message.message_id,
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup().add(
-            InlineKeyboardButton("🔙 Back to details", callback_data=f"manage:{instance_id}")
-        )
-    )
-    bot.answer_callback_query(call.id)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("delete:"))
-def delete_instance_cb(call):
-    instance_id = int(call.data.split(":")[1])
-    inst = get_instance(instance_id)
-    if inst['user_id'] != call.from_user.id and not is_owner(call.from_user.id):
+    if inst['user_id'] != call.from_user.id and call.from_user.id != OWNER_ID:
         bot.answer_callback_query(call.id, "Not allowed.")
         return
-    delete_instance(instance_id)
-    bot.answer_callback_query(call.id, "Instance deleted.", show_alert=True)
+    delete_instance_by_uuid(instance_uuid)
+    bot.answer_callback_query(call.id, "VPS deleted.", show_alert=True)
     bot.delete_message(call.message.chat.id, call.message.message_id)
     bot.send_message(call.message.chat.id, "Instance removed.", reply_markup=main_menu(call.from_user.id))
 
@@ -1100,16 +822,17 @@ def delete_instance_cb(call):
 def back_to_myvps(call):
     my_vps(call.message)
 
-@bot.message_handler(func=lambda m: is_owner(m.from_user.id) and m.text == "⚙️ Admin Panel")
+# ---------- অ্যাডমিন হ্যান্ডলার ----------
+@bot.message_handler(func=lambda m: m.from_user.id == OWNER_ID and m.text == "⚙️ Admin Panel")
 def admin_panel(message):
     bot.send_message(message.chat.id, "🛠 Admin Panel", reply_markup=admin_menu())
 
-@bot.message_handler(func=lambda m: is_owner(m.from_user.id) and m.text == "🔐 Generate Key")
+@bot.message_handler(func=lambda m: m.from_user.id == OWNER_ID and m.text == "🔐 Generate Key")
 def gen_key_prompt(message):
     msg = bot.send_message(
         message.chat.id,
         "Enter duration in days and max servers, separated by space.\n"
-        "Example: `30 2`  (30 days, 2 servers per key)",
+        "Example: `30 2`",
         parse_mode="Markdown",
         reply_markup=back_menu()
     )
@@ -1134,7 +857,7 @@ def process_gen_key(message):
     except:
         bot.send_message(message.chat.id, "Invalid input. Use: days max_servers", reply_markup=admin_menu())
 
-@bot.message_handler(func=lambda m: is_owner(m.from_user.id) and m.text == "🗝 List Keys")
+@bot.message_handler(func=lambda m: m.from_user.id == OWNER_ID and m.text == "🗝 List Keys")
 def list_keys(message):
     keys = list_core_keys(active_only=True)
     if not keys:
@@ -1142,25 +865,23 @@ def list_keys(message):
         return
     text = "🔑 **Active Core Keys**\n\n"
     for k in keys:
-        used = k['used_count']
-        max_srv = k['max_servers']
-        text += f"`{k['key']}` – {k['duration_days']}d, used {used}/{max_srv}\n"
+        text += f"`{k['key']}` – {k['duration_days']}d, used {k['used_count']}/{k['max_servers']}\n"
     bot.send_message(message.chat.id, text, parse_mode="Markdown", reply_markup=admin_menu())
 
-@bot.message_handler(func=lambda m: is_owner(m.from_user.id) and m.text == "📋 All Instances")
+@bot.message_handler(func=lambda m: m.from_user.id == OWNER_ID and m.text == "📋 All Instances")
 def all_instances(message):
-    insts = get_all_instances(limit=20)
-    if not insts:
+    with get_db() as conn:
+        rows = conn.execute("SELECT * FROM instances ORDER BY created_at DESC LIMIT 20").fetchall()
+    if not rows:
         bot.send_message(message.chat.id, "No instances.", reply_markup=admin_menu())
         return
     text = "📋 **Recent Instances**\n\n"
-    for i in insts:
-        expires = datetime.fromtimestamp(i['expires_at']).strftime("%Y-%m-%d")
-        status_icon = "🟢" if i['status'] == 'running' else "🔴"
-        text += f"{status_icon} User `{i['user_id']}` – Port {i['port']} – expires {expires}\n"
+    for r in rows:
+        expires = datetime.fromtimestamp(r['expires_at']).strftime("%Y-%m-%d")
+        text += f"• User `{r['user_id']}` – UUID `{r['instance_uuid'][:8]}` – expires {expires}\n"
     bot.send_message(message.chat.id, text, parse_mode="Markdown", reply_markup=admin_menu())
 
-@bot.message_handler(func=lambda m: is_owner(m.from_user.id) and m.text == "👥 User Management")
+@bot.message_handler(func=lambda m: m.from_user.id == OWNER_ID and m.text == "👥 User Management")
 def user_management(message):
     users = get_all_users(limit=10)
     if not users:
@@ -1174,7 +895,7 @@ def user_management(message):
         markup.add(InlineKeyboardButton(btn_text, callback_data=f"admin_user:{u['user_id']}"))
     bot.send_message(message.chat.id, text, reply_markup=markup)
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_user:"))
+@bot.callback_query_handler(func=lambda call: call.from_user.id == OWNER_ID and call.data.startswith("admin_user:"))
 def admin_user_detail(call):
     user_id = int(call.data.split(":")[1])
     user = get_user(user_id)
@@ -1182,34 +903,28 @@ def admin_user_detail(call):
         bot.answer_callback_query(call.id, "User not found.")
         return
     instances = get_user_instances(user_id, include_expired=True)
-    active_count = sum(1 for i in instances if i['status'] == 'running' and i['expires_at'] > time.time())
+    active = sum(1 for i in instances if i['expires_at'] > time.time())
     text = (
         f"👤 **User Details**\n"
         f"ID: `{user_id}`\n"
         f"Name: {user.get('first_name','')}\n"
         f"Username: @{user.get('username','')}\n"
         f"Joined: {datetime.fromtimestamp(user['created_at']).strftime('%Y-%m-%d')}\n"
-        f"Last interaction: {datetime.fromtimestamp(user['last_interaction']).strftime('%Y-%m-%d %H:%M')}\n"
+        f"Last: {datetime.fromtimestamp(user['last_interaction']).strftime('%Y-%m-%d %H:%M')}\n"
         f"Blocked: {'Yes' if user['blocked'] else 'No'}\n"
-        f"Total servers: {len(instances)}\n"
-        f"Active servers: {active_count}\n"
+        f"Total VPS: {len(instances)}\n"
+        f"Active: {active}\n"
     )
     markup = InlineKeyboardMarkup()
     if user['blocked']:
         markup.add(InlineKeyboardButton("✅ Unblock", callback_data=f"admin_unblock:{user_id}"))
     else:
         markup.add(InlineKeyboardButton("❌ Block", callback_data=f"admin_block:{user_id}"))
-    markup.add(InlineKeyboardButton("🔙 Back to users", callback_data="admin_back_users"))
-    bot.edit_message_text(
-        text,
-        call.message.chat.id,
-        call.message.message_id,
-        parse_mode="Markdown",
-        reply_markup=markup
-    )
+    markup.add(InlineKeyboardButton("🔙 Back", callback_data="admin_back_users"))
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode="Markdown", reply_markup=markup)
     bot.answer_callback_query(call.id)
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_block:"))
+@bot.callback_query_handler(func=lambda call: call.from_user.id == OWNER_ID and call.data.startswith("admin_block:"))
 def admin_block(call):
     user_id = int(call.data.split(":")[1])
     block_user(user_id)
@@ -1217,7 +932,7 @@ def admin_block(call):
     call.data = f"admin_user:{user_id}"
     admin_user_detail(call)
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_unblock:"))
+@bot.callback_query_handler(func=lambda call: call.from_user.id == OWNER_ID and call.data.startswith("admin_unblock:"))
 def admin_unblock(call):
     user_id = int(call.data.split(":")[1])
     unblock_user(user_id)
@@ -1225,77 +940,11 @@ def admin_unblock(call):
     call.data = f"admin_user:{user_id}"
     admin_user_detail(call)
 
-@bot.callback_query_handler(func=lambda call: call.data == "admin_back_users")
+@bot.callback_query_handler(func=lambda call: call.from_user.id == OWNER_ID and call.data == "admin_back_users")
 def admin_back_users(call):
     user_management(call.message)
 
-@bot.message_handler(func=lambda m: is_owner(m.from_user.id) and m.text == "🔧 Settings")
-def settings_menu(message):
-    port_min = get_setting("port_min", PORT_MIN)
-    port_max = get_setting("port_max", PORT_MAX)
-    public_host = get_setting("public_host", get_public_host())
-    text = (
-        f"🔧 **Current Settings**\n\n"
-        f"Port range: `{port_min} – {port_max}`\n"
-        f"Public host: `{public_host}`\n\n"
-        "Use buttons below to change."
-    )
-    markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton("✏️ Change Port Range", callback_data="admin_set_port"))
-    markup.add(InlineKeyboardButton("🌍 Set Public Host", callback_data="admin_set_public_host"))
-    bot.send_message(message.chat.id, text, parse_mode="Markdown", reply_markup=markup)
-
-@bot.callback_query_handler(func=lambda call: call.data == "admin_set_port")
-def admin_set_port_prompt(call):
-    msg = bot.send_message(
-        call.message.chat.id,
-        "Enter new port range (min max), e.g. `2000 3000`:\n"
-        "Both numbers must be between 1024 and 65535, min < max.",
-        parse_mode="Markdown"
-    )
-    bot.register_next_step_handler(msg, process_set_port)
-
-def process_set_port(message):
-    try:
-        min_port, max_port = map(int, message.text.split())
-        if min_port < 1024 or max_port > 65535 or min_port >= max_port:
-            raise ValueError
-        set_setting("port_min", min_port)
-        set_setting("port_max", max_port)
-        bot.send_message(
-            message.chat.id,
-            f"✅ Port range updated to {min_port}-{max_port}",
-            reply_markup=admin_menu()
-        )
-        log_action("change_port_range", message.from_user.id, f"{min_port}-{max_port}")
-    except:
-        bot.send_message(message.chat.id, "Invalid range. Use: min max", reply_markup=admin_menu())
-
-@bot.callback_query_handler(func=lambda call: call.data == "admin_set_public_host")
-def admin_set_public_host_prompt(call):
-    msg = bot.send_message(
-        call.message.chat.id,
-        "Enter public hostname or IP address.\n"
-        "Example: `203.0.113.1` or `vps.example.com`\n"
-        "Leave empty to auto‑detect.",
-        parse_mode="Markdown"
-    )
-    bot.register_next_step_handler(msg, process_set_public_host)
-
-def process_set_public_host(message):
-    host = message.text.strip()
-    if not host:
-        host = detect_public_ip()
-    set_setting("public_host", host)
-    bot.send_message(
-        message.chat.id,
-        f"✅ Public host set to: `{host}`",
-        parse_mode="Markdown",
-        reply_markup=admin_menu()
-    )
-    log_action("set_public_host", message.from_user.id, host)
-
-@bot.message_handler(func=lambda m: is_owner(m.from_user.id) and m.text == "📊 Detailed Stats")
+@bot.message_handler(func=lambda m: m.from_user.id == OWNER_ID and m.text == "📊 Detailed Stats")
 def detailed_stats(message):
     stats = get_stats()
     text = (
@@ -1305,7 +954,7 @@ def detailed_stats(message):
         f"• Active: {stats['active_keys']}\n\n"
         f"🖥 **Instances**\n"
         f"• Total: {stats['total_instances']}\n"
-        f"• Running: {stats['running_instances']}\n"
+        f"• Active: {stats['active_instances']}\n"
         f"• Expired: {stats['expired_instances']}\n\n"
         f"👥 **Users**\n"
         f"• Total: {stats['total_users']}\n"
@@ -1313,235 +962,36 @@ def detailed_stats(message):
         f"📁 **Files**\n"
         f"• Total uploaded: {stats['total_files']}\n"
     )
-    if PSUTIL_AVAILABLE:
-        text += (
-            f"\n🖥 **System Resources**\n"
-            f"• CPU: {stats['cpu']}%\n"
-            f"• RAM: {stats['ram']}%\n"
-            f"• Disk: {stats['disk']}%\n"
-        )
     bot.send_message(message.chat.id, text, parse_mode="Markdown", reply_markup=admin_menu())
+
+@bot.message_handler(func=lambda m: m.from_user.id == OWNER_ID and m.text == "🔙 Back")
+def admin_back(message):
+    user_id = message.from_user.id
+    bot.send_message(message.chat.id, "Main menu:", reply_markup=main_menu(user_id))
 
 @bot.message_handler(func=lambda m: True)
 def fallback(message):
     user_id = message.from_user.id
     bot.send_message(message.chat.id, "Please use the menu buttons.", reply_markup=main_menu(user_id))
 
-# ==================== FLASK WEBHOOK & ADMIN ====================
-
-app = Flask(__name__)
-app.secret_key = INSTANCE_SECRET
-
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    if request.headers.get('content-type') == 'application/json':
-        json_string = request.get_data().decode('utf-8')
-        update = Update.de_json(json_string)
-        bot.process_new_updates([update])
-        return '', 200
-    return '', 403
-
-def set_webhook():
-    if not PUBLIC_URL:
-        logger.error("PUBLIC_URL not set. Cannot set webhook.")
-        return False
-    webhook_url = f"{PUBLIC_URL}/webhook"
-    bot.remove_webhook()
-    time.sleep(0.5)
-    bot.set_webhook(url=webhook_url)
-    logger.info(f"Webhook set to {webhook_url}")
-    return True
-
-def verify_admin(core_key, instance_secret):
-    return core_key == os.getenv("CORE_KEY", "CHANGE_ME") and instance_secret == INSTANCE_SECRET
-
-@app.route('/')
-def index():
-    return redirect(url_for('admin_login'))
-
-@app.route('/admin/login', methods=['GET', 'POST'])
-def admin_login():
-    if request.method == 'POST':
-        core = request.form.get('core_key')
-        secret = request.form.get('instance_secret')
-        if verify_admin(core, secret):
-            session['admin'] = True
-            return redirect(url_for('admin_dashboard'))
-        else:
-            return "Invalid credentials", 403
-    return '''
-    <h2>Admin Login</h2>
-    <form method="post">
-        <label>Core Key:</label><br>
-        <input type="password" name="core_key"><br>
-        <label>Instance Secret:</label><br>
-        <input type="password" name="instance_secret"><br><br>
-        <input type="submit" value="Login">
-    </form>
-    '''
-
-def admin_required(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        if not session.get('admin'):
-            return redirect(url_for('admin_login'))
-        return f(*args, **kwargs)
-    return decorated
-
+# ---------- ফ্লাস্ক অ্যাডমিন প্যানেল (ঐচ্ছিক) ----------
 @app.route('/admin/dashboard')
-@admin_required
 def admin_dashboard():
-    stats = get_stats()
-    port_min = get_setting("port_min", PORT_MIN)
-    port_max = get_setting("port_max", PORT_MAX)
-    public_host = get_setting("public_host", get_public_host())
-    html = f"""
-    <h2>Instance {INSTANCE_ID} Dashboard</h2>
-    <h3>System Overview</h3>
-    <ul>
-        <li>Total Keys: {stats['total_keys']}</li>
-        <li>Active Keys: {stats['active_keys']}</li>
-        <li>Total Instances: {stats['total_instances']}</li>
-        <li>Running Instances: {stats['running_instances']}</li>
-        <li>Total Users: {stats['total_users']}</li>
-        <li>Blocked Users: {stats['blocked_users']}</li>
-        <li>Total Files: {stats['total_files']}</li>
-        <li>Port Range: {port_min} - {port_max}</li>
-        <li>Public Host: {public_host}</li>
-    </ul>
-    <p><a href="/admin/instances">Manage Instances</a></p>
-    <p><a href="/admin/users">Manage Users</a></p>
-    <p><a href="/admin/keys">Core Keys</a></p>
-    <p><a href="/admin/settings">Settings</a></p>
-    <p><a href="/admin/export">Export Database</a></p>
-    """
-    return html
+    # সরলীকৃত – প্রোডাকশনে এডমিন লগিন যুক্ত করবেন
+    return "Admin Dashboard – under construction"
 
-@app.route('/admin/instances')
-@admin_required
-def admin_instances():
-    instances = get_all_instances(limit=100)
-    html = "<h2>All Instances</h2><table border='1'><tr><th>ID</th><th>User</th><th>Port</th><th>Status</th><th>Expires</th><th>Actions</th></tr>"
-    for i in instances:
-        expires = datetime.fromtimestamp(i['expires_at']).strftime("%Y-%m-%d %H:%M")
-        html += f"<tr><td>{i['id']}</td><td>{i['user_id']}</td><td>{i['port']}</td><td>{i['status']}</td><td>{expires}</td>"
-        html += f"<td><a href='/admin/instance/{i['id']}/stop'>Stop</a> | <a href='/admin/instance/{i['id']}/start'>Start</a> | <a href='/admin/instance/{i['id']}/delete'>Delete</a></td></tr>"
-    html += "</table><p><a href='/admin/dashboard'>Back</a></p>"
-    return html
-
-@app.route('/admin/instance/<int:instance_id>/<action>')
-@admin_required
-def admin_instance_action(instance_id, action):
-    if action == 'stop':
-        stop_file_server(instance_id)
-    elif action == 'start':
-        start_file_server(instance_id)
-    elif action == 'delete':
-        delete_instance(instance_id)
-    return redirect(url_for('admin_instances'))
-
-@app.route('/admin/users')
-@admin_required
-def admin_users():
-    users = get_all_users(limit=100)
-    html = "<h2>Users</h2><table border='1'><tr><th>User ID</th><th>Name</th><th>Username</th><th>Blocked</th><th>Actions</th></tr>"
-    for u in users:
-        html += f"<tr><td>{u['user_id']}</td><td>{u['first_name']}</td><td>{u['username']}</td><td>{u['blocked']}</td>"
-        if u['blocked']:
-            html += f"<td><a href='/admin/user/{u['user_id']}/unblock'>Unblock</a></td>"
-        else:
-            html += f"<td><a href='/admin/user/{u['user_id']}/block'>Block</a></td>"
-        html += "</tr>"
-    html += "</table><p><a href='/admin/dashboard'>Back</a></p>"
-    return html
-
-@app.route('/admin/user/<int:user_id>/block')
-@admin_required
-def admin_user_block(user_id):
-    block_user(user_id)
-    return redirect(url_for('admin_users'))
-
-@app.route('/admin/user/<int:user_id>/unblock')
-@admin_required
-def admin_user_unblock(user_id):
-    unblock_user(user_id)
-    return redirect(url_for('admin_users'))
-
-@app.route('/admin/keys')
-@admin_required
-def admin_keys():
-    keys = list_core_keys(active_only=False)
-    html = "<h2>Core Keys</h2><table border='1'><tr><th>Key</th><th>Duration</th><th>Max Servers</th><th>Used</th><th>Active</th><th>Created</th></tr>"
-    for k in keys:
-        created = datetime.fromtimestamp(k['created_at']).strftime("%Y-%m-%d")
-        html += f"<tr><td>{k['key']}</td><td>{k['duration_days']}d</td><td>{k['max_servers']}</td><td>{k['used_count']}</td><td>{k['is_active']}</td><td>{created}</td></tr>"
-    html += "</table><p><a href='/admin/dashboard'>Back</a></p>"
-    return html
-
-@app.route('/admin/settings', methods=['GET', 'POST'])
-@admin_required
-def admin_settings():
-    if request.method == 'POST':
-        min_port = request.form.get('port_min')
-        max_port = request.form.get('port_max')
-        public_host = request.form.get('public_host')
-        try:
-            if min_port and max_port:
-                min_port = int(min_port)
-                max_port = int(max_port)
-                if 1024 <= min_port < max_port <= 65535:
-                    set_setting("port_min", min_port)
-                    set_setting("port_max", max_port)
-            if public_host is not None:
-                set_setting("public_host", public_host.strip())
-        except:
-            pass
-        return redirect(url_for('admin_settings'))
-    port_min = get_setting("port_min", PORT_MIN)
-    port_max = get_setting("port_max", PORT_MAX)
-    public_host = get_setting("public_host", get_public_host())
-    html = f"""
-    <h2>Settings</h2>
-    <form method="post">
-        <label>Port Min:</label><br>
-        <input type="number" name="port_min" value="{port_min}" min="1024" max="65535"><br>
-        <label>Port Max:</label><br>
-        <input type="number" name="port_max" value="{port_max}" min="1024" max="65535"><br>
-        <label>Public Host (IP or domain):</label><br>
-        <input type="text" name="public_host" value="{public_host}" size="30"><br><br>
-        <input type="submit" value="Save">
-    </form>
-    <p><a href='/admin/dashboard'>Back</a></p>
-    """
-    return html
-
-@app.route('/admin/export')
-@admin_required
-def admin_export():
-    return send_file(DB_FILE, as_attachment=True, download_name=f"instance_{INSTANCE_ID}.db")
-
-# ==================== MAIN ====================
+# ==================== মেইন ====================
 
 def main():
     init_db()
-    # Auto‑detect public IP
-    public_ip = detect_public_ip()
-    if not get_setting("public_host"):
-        set_setting("public_host", public_ip)
-
-    # Start expiry checker
-    threading.Thread(target=expiry_checker, daemon=True).start()
-
-    # Set webhook if PUBLIC_URL is available
+    # ওয়েবহুক সেট
     if PUBLIC_URL:
         set_webhook()
     else:
-        logger.error("PUBLIC_URL not set. Bot will not receive updates. Set it in .env or Render dashboard.")
-        logger.info("Continuing with Flask server – you can set webhook manually later.")
-
-    # Run Flask – Render provides PORT env
-    logger.info(f"Starting Flask on http://0.0.0.0:{WEBHOOK_PORT}")
-    app.run(host="0.0.0.0", port=WEBHOOK_PORT, debug=False, use_reloader=False)
+        logger.warning("PUBLIC_URL not set. Webhook not configured.")
+    # ফ্লাস্ক চালু
+    logger.info(f"Starting Flask on 0.0.0.0:{PORT}")
+    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
 
 if __name__ == "__main__":
     main()
