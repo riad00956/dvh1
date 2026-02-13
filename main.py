@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Telegram VPS Bot – Bangladesh Edition
-- Webhook mode (no 409 conflict)
+Telegram VPS Bot – Bangladesh Edition (Render Optimised)
+- Webhook only – no polling, no 409 conflicts
+- Auto‑detects Render URL & port
 - Custom login page (index.html)
 - Public file servers with cookie‑based session
-- Full admin control, renewal, user blocking, port range
 """
 
 import os
@@ -29,6 +29,9 @@ from urllib.parse import parse_qs, unquote
 import base64
 import html
 import shutil
+
+# 🔥 FIX: MISSING IMPORT
+from http.server import HTTPServer, SimpleHTTPRequestHandler
 
 # Third‑party
 from dotenv import load_dotenv, set_key
@@ -57,7 +60,6 @@ except ImportError:
 ENV_FILE = ".env"
 load_dotenv(ENV_FILE)
 
-# Provided credentials (used as fallback)
 DEFAULT_BOT_TOKEN = "8011804210:AAE--NiCSKKjbX4TC3nJVxuW64Fu53Ywh0w"
 DEFAULT_OWNER_ID = 8373846582
 
@@ -82,12 +84,19 @@ if not INSTANCE_SECRET:
     INSTANCE_SECRET = str(uuid.uuid4())
     set_key(ENV_FILE, "INSTANCE_SECRET", INSTANCE_SECRET)
 
-# Flask ports
-WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", 8443))   # Telegram webhook receiver
-ADMIN_PORT = int(os.getenv("ADMIN_PORT", 5000))       # Admin panel
-
-# Public webhook URL (must be set manually or via --public-url)
+# 🌍 Public URL – auto‑detect from Render if not set
 PUBLIC_URL = os.getenv("PUBLIC_URL", "")
+if not PUBLIC_URL:
+    PUBLIC_URL = os.getenv("RENDER_EXTERNAL_URL", "")   # Render provides this
+    if PUBLIC_URL:
+        os.environ["PUBLIC_URL"] = PUBLIC_URL
+        set_key(ENV_FILE, "PUBLIC_URL", PUBLIC_URL)
+
+# Port configuration – Render uses $PORT
+WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", 8443))
+RENDER_PORT = os.getenv("PORT")          # Set by Render
+if RENDER_PORT:
+    WEBHOOK_PORT = int(RENDER_PORT)
 
 # Default port range for file servers
 DEFAULT_PORT_MIN = 2000
@@ -99,7 +108,7 @@ PORT_MAX = int(os.getenv("PORT_MAX", DEFAULT_PORT_MAX))
 PUBLIC_HOST = os.getenv("PUBLIC_HOST", "")
 
 # Path to custom login page
-LOGIN_PAGE = "index.html"   # will be served by file servers
+LOGIN_PAGE = "index.html"
 
 # Database
 DB_FILE = f"instance_{INSTANCE_ID}.db"
@@ -121,7 +130,6 @@ def get_db():
 
 def init_db():
     with get_db() as conn:
-        # Settings
         conn.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
@@ -132,7 +140,6 @@ def init_db():
         conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('port_max', ?)", (str(PORT_MAX),))
         conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('public_host', ?)", (PUBLIC_HOST,))
 
-        # Core keys
         conn.execute("""
             CREATE TABLE IF NOT EXISTS core_keys (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -145,7 +152,6 @@ def init_db():
                 is_active INTEGER DEFAULT 1
             )
         """)
-        # Instances
         conn.execute("""
             CREATE TABLE IF NOT EXISTS instances (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -162,7 +168,6 @@ def init_db():
                 renewed_from INTEGER
             )
         """)
-        # Users
         conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -174,7 +179,6 @@ def init_db():
                 blocked INTEGER DEFAULT 0
             )
         """)
-        # File upload logs
         conn.execute("""
             CREATE TABLE IF NOT EXISTS files (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -186,7 +190,6 @@ def init_db():
                 FOREIGN KEY(instance_id) REFERENCES instances(id) ON DELETE CASCADE
             )
         """)
-        # Logs
         conn.execute("""
             CREATE TABLE IF NOT EXISTS logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -199,7 +202,6 @@ def init_db():
         conn.commit()
     logger.info("Database initialized")
 
-# ---------- Settings ----------
 def get_setting(key, default=None):
     with get_db() as conn:
         row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
@@ -211,7 +213,6 @@ def set_setting(key, value):
         conn.commit()
     set_key(ENV_FILE, key.upper(), str(value))
 
-# ---------- Public IP / Host ----------
 def detect_public_ip():
     if REQUESTS_AVAILABLE:
         try:
@@ -236,7 +237,6 @@ def get_public_host():
         set_setting("public_host", host)
     return host
 
-# ---------- Core Keys ----------
 def generate_core_key(duration_days, max_servers, admin_id):
     key = "CORE-" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=12))
     with get_db() as conn:
@@ -270,7 +270,6 @@ def list_core_keys(active_only=True):
             rows = conn.execute("SELECT * FROM core_keys ORDER BY created_at DESC").fetchall()
     return [dict(r) for r in rows]
 
-# ---------- Instances ----------
 def get_available_port():
     port_min = int(get_setting("port_min", PORT_MIN))
     port_max = int(get_setting("port_max", PORT_MAX))
@@ -371,7 +370,6 @@ def get_expired_instances_for_user(user_id):
         ).fetchall()
     return [dict(r) for r in rows]
 
-# ---------- File Logging ----------
 def log_file_upload(instance_id, filename, filepath, size):
     with get_db() as conn:
         conn.execute(
@@ -380,12 +378,6 @@ def log_file_upload(instance_id, filename, filepath, size):
         )
         conn.commit()
 
-def get_files_for_instance(instance_id):
-    with get_db() as conn:
-        rows = conn.execute("SELECT * FROM files WHERE instance_id = ? ORDER BY uploaded_at DESC", (instance_id,)).fetchall()
-    return [dict(r) for r in rows]
-
-# ---------- Users ----------
 def update_user(user_id, first_name, username):
     with get_db() as conn:
         now = int(time.time())
@@ -425,7 +417,6 @@ def get_all_users(limit=100):
         rows = conn.execute("SELECT * FROM users ORDER BY last_interaction DESC LIMIT ?", (limit,)).fetchall()
     return [dict(r) for r in rows]
 
-# ---------- Logging ----------
 def log_action(action, user_id=None, details=None):
     with get_db() as conn:
         conn.execute(
@@ -434,7 +425,6 @@ def log_action(action, user_id=None, details=None):
         )
         conn.commit()
 
-# ---------- Statistics ----------
 def get_stats():
     with get_db() as conn:
         total_keys = conn.execute("SELECT COUNT(*) FROM core_keys").fetchone()[0]
@@ -461,8 +451,6 @@ def get_stats():
         stats["disk"] = psutil.disk_usage('/').percent
     return stats
 
-# ==================== UTILITY ====================
-
 def is_port_available(port):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
@@ -474,11 +462,9 @@ def is_port_available(port):
 def is_owner(user_id):
     return user_id == OWNER_ID
 
-# ==================== FILE SERVER WITH CUSTOM LOGIN PAGE ====================
+# ==================== FILE SERVER WITH CUSTOM LOGIN ====================
 
 class FileServerHandler(SimpleHTTPRequestHandler):
-    """HTTP Server with custom login page (index.html) and cookie session."""
-
     def __init__(self, *args, directory=None, password=None, instance_id=None, **kwargs):
         self.server_password = password
         self.instance_id = instance_id
@@ -497,7 +483,6 @@ class FileServerHandler(SimpleHTTPRequestHandler):
         cookie = self.parse_cookies()
         if cookie and 'vps_auth' in cookie:
             token = cookie['vps_auth'].value
-            # Simple auth: store password hash in cookie (secure enough for this use)
             expected = hashlib.sha256(self.server_password.encode()).hexdigest()
             return hmac.compare_digest(token, expected)
         return False
@@ -509,24 +494,19 @@ class FileServerHandler(SimpleHTTPRequestHandler):
         try:
             with open(self.login_page_path, 'r', encoding='utf-8') as f:
                 login_html = f.read()
-            # Replace placeholder with instance port (optional)
             login_html = login_html.replace('{{port}}', str(self.server.server_address[1]))
             self.wfile.write(login_html.encode('utf-8'))
         except FileNotFoundError:
-            # Fallback inline login
             self.wfile.write(b'''
             <!DOCTYPE html>
-            <html>
-            <head><title>Login</title></head>
-            <body>
-                <h2>VPS Login</h2>
+            <html><head><title>Login</title></head>
+            <body><h2>VPS Login</h2>
                 <form method="post" action="/login">
                     <label>Password:</label>
                     <input type="password" name="password">
                     <button type="submit">Login</button>
                 </form>
-            </body>
-            </html>
+            </body></html>
             ''')
 
     def do_GET(self):
@@ -536,12 +516,9 @@ class FileServerHandler(SimpleHTTPRequestHandler):
             self.send_header('Set-Cookie', 'vps_auth=; Path=/; Max-Age=0')
             self.end_headers()
             return
-
         if not self.is_authenticated():
             self.send_login_page()
             return
-
-        # Authenticated – serve file/directory
         path = self.translate_path(self.path)
         if os.path.isdir(path):
             self.serve_directory(path)
@@ -550,13 +527,11 @@ class FileServerHandler(SimpleHTTPRequestHandler):
 
     def do_POST(self):
         if self.path == '/login':
-            # Process login form
             content_length = int(self.headers.get('Content-Length', 0))
             post_data = self.rfile.read(content_length).decode('utf-8')
             params = parse_qs(post_data)
             password = params.get('password', [''])[0]
             if password == self.server_password:
-                # Set auth cookie
                 token = hashlib.sha256(self.server_password.encode()).hexdigest()
                 self.send_response(303)
                 self.send_header('Location', '/')
@@ -568,12 +543,9 @@ class FileServerHandler(SimpleHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(b'<h2>Invalid password</h2><a href="/">Try again</a>')
             return
-
         if not self.is_authenticated():
             self.send_login_page()
             return
-
-        # Handle file upload / delete (authenticated)
         content_type = self.headers.get('Content-Type', '')
         if 'multipart/form-data' in content_type:
             import cgi
@@ -608,13 +580,11 @@ class FileServerHandler(SimpleHTTPRequestHandler):
         self.wfile.write(b'Bad request')
 
     def serve_directory(self, path):
-        """Serve beautiful file listing (authenticated only)."""
         try:
             list = os.listdir(path)
         except OSError:
             self.send_error(404, "No permission")
             return
-
         list.sort(key=lambda a: a.lower())
         public_host = get_public_host()
         port = self.server.server_address[1]
@@ -649,7 +619,6 @@ class FileServerHandler(SimpleHTTPRequestHandler):
         <div class="info">
             <strong>Public URL:</strong> http://{public_host}:{port}<br>
         </div>
-
         <div class="upload-form">
             <h3>📤 Upload File</h3>
             <form action="/" method="post" enctype="multipart/form-data">
@@ -657,7 +626,6 @@ class FileServerHandler(SimpleHTTPRequestHandler):
                 <button type="submit" class="btn">Upload</button>
             </form>
         </div>
-
         <h3>📄 Files in this VPS</h3>
         <table>
             <tr>
@@ -708,7 +676,6 @@ class FileServerHandler(SimpleHTTPRequestHandler):
         pass
 
 def run_file_server(port, password, directory, instance_id):
-    """Run file server bound to 0.0.0.0 (public)."""
     server_address = ('0.0.0.0', port)
     handler = lambda *args, **kwargs: FileServerHandler(
         *args, directory=directory, password=password, instance_id=instance_id, **kwargs
@@ -797,7 +764,6 @@ def expiry_checker():
 
 bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 
-# ---------- Persistent Keyboards ----------
 def main_menu(user_id):
     markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     markup.add(
@@ -827,18 +793,6 @@ def back_menu():
     markup.add(KeyboardButton("🔙 Back"))
     return markup
 
-# ---------- Message Editing Helper ----------
-def edit_or_send(chat_id, text, reply_markup=None, parse_mode=None, message_id=None):
-    if message_id:
-        try:
-            bot.edit_message_text(text, chat_id, message_id, reply_markup=reply_markup, parse_mode=parse_mode)
-            return message_id
-        except:
-            pass
-    msg = bot.send_message(chat_id, text, reply_markup=reply_markup, parse_mode=parse_mode)
-    return msg.message_id
-
-# ---------- Handlers ----------
 @bot.message_handler(commands=['start'])
 def start_cmd(message):
     user_id = message.from_user.id
@@ -861,11 +815,7 @@ def start_cmd(message):
 @bot.message_handler(func=lambda m: m.text == "🔙 Back")
 def back_handler(message):
     user_id = message.from_user.id
-    bot.send_message(
-        message.chat.id,
-        "Main menu:",
-        reply_markup=main_menu(user_id)
-    )
+    bot.send_message(message.chat.id, "Main menu:", reply_markup=main_menu(user_id))
 
 @bot.message_handler(func=lambda m: m.text == "📞 Help")
 def help_handler(message):
@@ -883,7 +833,6 @@ def help_handler(message):
     )
     bot.send_message(message.chat.id, text, parse_mode="Markdown")
 
-# ---------- Redeem Key (with Renewal) ----------
 @bot.message_handler(func=lambda m: m.text == "🔑 Redeem Key")
 def redeem_prompt(message):
     user_id = message.from_user.id
@@ -906,7 +855,6 @@ def process_redeem(message):
     if not core_key:
         bot.send_message(message.chat.id, "❌ Invalid or expired Core Key.", reply_markup=main_menu(user_id))
         return
-
     expired_instances = get_expired_instances_for_user(user_id)
     if expired_instances:
         markup = InlineKeyboardMarkup()
@@ -922,7 +870,6 @@ def process_redeem(message):
             reply_markup=markup
         )
         return
-
     create_new_server(user_id, core_key, message.chat.id)
 
 def create_new_server(user_id, core_key, chat_id):
@@ -1018,7 +965,6 @@ def cancel_renew_cb(call):
     bot.edit_message_text("Cancelled.", call.message.chat.id, call.message.message_id)
     bot.answer_callback_query(call.id)
 
-# ---------- My VPS ----------
 @bot.message_handler(func=lambda m: m.text == "🖥 My VPS")
 def my_vps(message):
     user_id = message.from_user.id
@@ -1048,7 +994,6 @@ def manage_instance(call):
     if inst['user_id'] != user_id and not is_owner(user_id):
         bot.answer_callback_query(call.id, "Access denied.")
         return
-
     expires_str = datetime.fromtimestamp(inst['expires_at']).strftime("%Y-%m-%d %H:%M")
     public_host = get_public_host()
     text = (
@@ -1074,7 +1019,6 @@ def manage_instance(call):
     if is_owner(user_id) or inst['user_id'] == user_id:
         markup.add(InlineKeyboardButton("🗑 Delete", callback_data=f"delete:{instance_id}"))
     markup.add(InlineKeyboardButton("🔙 Back to list", callback_data="back_to_myvps"))
-
     bot.edit_message_text(
         text,
         call.message.chat.id,
@@ -1156,7 +1100,6 @@ def delete_instance_cb(call):
 def back_to_myvps(call):
     my_vps(call.message)
 
-# ---------- Admin Panel ----------
 @bot.message_handler(func=lambda m: is_owner(m.from_user.id) and m.text == "⚙️ Admin Panel")
 def admin_panel(message):
     bot.send_message(message.chat.id, "🛠 Admin Panel", reply_markup=admin_menu())
@@ -1379,22 +1322,16 @@ def detailed_stats(message):
         )
     bot.send_message(message.chat.id, text, parse_mode="Markdown", reply_markup=admin_menu())
 
-# ---------- Fallback ----------
 @bot.message_handler(func=lambda m: True)
 def fallback(message):
     user_id = message.from_user.id
-    bot.send_message(
-        message.chat.id,
-        "Please use the menu buttons.",
-        reply_markup=main_menu(user_id)
-    )
+    bot.send_message(message.chat.id, "Please use the menu buttons.", reply_markup=main_menu(user_id))
 
 # ==================== FLASK WEBHOOK & ADMIN ====================
 
 app = Flask(__name__)
 app.secret_key = INSTANCE_SECRET
 
-# ---------- Telegram Webhook ----------
 @app.route('/webhook', methods=['POST'])
 def webhook():
     if request.headers.get('content-type') == 'application/json':
@@ -1415,7 +1352,6 @@ def set_webhook():
     logger.info(f"Webhook set to {webhook_url}")
     return True
 
-# ---------- Flask Admin ----------
 def verify_admin(core_key, instance_secret):
     return core_key == os.getenv("CORE_KEY", "CHANGE_ME") and instance_secret == INSTANCE_SECRET
 
@@ -1596,18 +1532,15 @@ def main():
     # Start expiry checker
     threading.Thread(target=expiry_checker, daemon=True).start()
 
-    # Set webhook if PUBLIC_URL is provided
+    # Set webhook if PUBLIC_URL is available
     if PUBLIC_URL:
         set_webhook()
     else:
-        logger.warning("PUBLIC_URL not set. Bot will not receive updates. Set it in .env")
+        logger.error("PUBLIC_URL not set. Bot will not receive updates. Set it in .env or Render dashboard.")
+        logger.info("Continuing with Flask server – you can set webhook manually later.")
 
-    # Run Flask (webhook receiver + admin panel)
-    # We'll run on ADMIN_PORT, but Telegram webhook expects WEBHOOK_PORT.
-    # If they are different, you need to proxy or set PUBLIC_URL accordingly.
-    # For simplicity, we run Flask on WEBHOOK_PORT (Telegram endpoint) and admin on same port.
-    # If you need admin on separate port, adjust.
-    logger.info(f"Starting Flask on http://0.0.0.0:{WEBHOOK_PORT} (webhook & admin)")
+    # Run Flask – Render provides PORT env
+    logger.info(f"Starting Flask on http://0.0.0.0:{WEBHOOK_PORT}")
     app.run(host="0.0.0.0", port=WEBHOOK_PORT, debug=False, use_reloader=False)
 
 if __name__ == "__main__":
